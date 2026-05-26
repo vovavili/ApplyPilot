@@ -54,3 +54,31 @@ def test_anthropic_client_reports_error_body():
 
     with pytest.raises(RuntimeError, match="temperature.*deprecated"):
         client.chat([{"role": "user", "content": "Hello"}])
+
+
+def test_anthropic_client_uses_env_timeout(monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_LLM_TIMEOUT_SECONDS", "42")
+
+    client = AnthropicLLMClient("claude-opus-4-7", "test-key")
+
+    assert client._client.timeout.read == 42
+    assert client._client.timeout.connect == 20
+
+
+def test_anthropic_client_honors_env_retry_limit_on_timeout(monkeypatch):
+    class TimeoutHTTPClient:
+        calls = 0
+
+        def post(self, *_args, **_kwargs):
+            self.calls += 1
+            raise httpx.ReadTimeout("slow model")
+
+    monkeypatch.setenv("APPLYPILOT_LLM_MAX_RETRIES", "2")
+    http_client = TimeoutHTTPClient()
+    client = AnthropicLLMClient("claude-opus-4-7", "test-key")
+    client._client = http_client
+
+    with pytest.raises(httpx.ReadTimeout):
+        client.chat([{"role": "user", "content": "Hello"}])
+
+    assert http_client.calls == 2

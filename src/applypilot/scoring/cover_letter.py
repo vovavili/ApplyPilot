@@ -148,6 +148,25 @@ def _cover_provider_override() -> str:
     return os.environ.get("COVER_LLM_PROVIDER", "").strip().casefold()
 
 
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        return max(int(value), minimum)
+    except ValueError:
+        log.warning("Invalid %s=%r; using %s", name, value, default)
+        return default
+
+
+def _cover_max_retries() -> int:
+    return _env_int("COVER_MAX_RETRIES", 3, minimum=0)
+
+
+def _cover_max_tokens() -> int:
+    return _env_int("COVER_LLM_MAX_TOKENS", 2200, minimum=1000)
+
+
 def _is_claude_model(model: str) -> bool:
     normalized = model.strip().casefold()
     return normalized.startswith(("claude-", "anthropic/claude-"))
@@ -426,10 +445,13 @@ def generate_cover_letter(
     resume_text: str,
     job: dict,
     profile: dict,
-    max_retries: int = 3,
+    max_retries: int | None = None,
     validation_mode: str = "normal",
 ) -> tuple[str, dict]:
     """Generate a complete cover letter from structured model output."""
+    if max_retries is None:
+        max_retries = _cover_max_retries()
+
     job_text = (
         f"TITLE: {_display_title(job)}\n"
         f"COMPANY: {_display_company(job)}\n"
@@ -441,6 +463,7 @@ def generate_cover_letter(
     avoid_notes: list[str] = []
     client = _get_cover_client()
     cl_prompt_base = _build_cover_letter_prompt(profile)
+    max_tokens = _cover_max_tokens()
     expected_signoff = profile.get("personal", {}).get("preferred_name") or profile.get("personal", {}).get(
         "full_name",
         "",
@@ -483,7 +506,36 @@ def generate_cover_letter(
         ]
 
         try:
-            raw = sanitize_text(client.chat(messages, max_tokens=2200, temperature=0.2))
+            started = time.time()
+            emit_event(
+                "cover_letter_attempt_started",
+                stage="cover",
+                job_title=job.get("title"),
+                site=job.get("site"),
+                job_url=job.get("url"),
+                attempt=attempt + 1,
+                max_attempts=max_retries + 1,
+                model=report["model"],
+                max_tokens=max_tokens,
+            )
+            log.info(
+                "Cover letter attempt %d/%d started | %s | %s",
+                attempt + 1,
+                max_retries + 1,
+                job.get("title", "Untitled"),
+                job.get("site", "Unknown"),
+            )
+            raw = sanitize_text(client.chat(messages, max_tokens=max_tokens, temperature=0.2))
+            emit_event(
+                "cover_letter_attempt_response",
+                stage="cover",
+                job_title=job.get("title"),
+                site=job.get("site"),
+                job_url=job.get("url"),
+                attempt=attempt + 1,
+                elapsed_seconds=round(time.time() - started, 1),
+                raw_chars=len(raw),
+            )
         except Exception as exc:
             fallback_reason = "llm_error"
             report["llm_errors"].append({"attempt": attempt + 1, "error": str(exc)})

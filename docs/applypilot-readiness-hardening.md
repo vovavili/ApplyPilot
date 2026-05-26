@@ -65,6 +65,28 @@ Fallback is still there, but only as a safety net. Reports now include
 excerpts from failed attempts. The batch summary also reports how many generated
 letters used fallback.
 
+## Long-running LLM calls
+
+Resume tailoring now logs before every model attempt, not only after a job
+finishes. If a model call is slow, the terminal should show which job and attempt
+is waiting. The structured event log also records `tailor_job_started`,
+`tailor_attempt_started`, and `tailor_attempt_response` events.
+
+The main knobs live in `.env`:
+
+```text
+APPLYPILOT_LLM_TIMEOUT_SECONDS=75
+APPLYPILOT_LLM_MAX_RETRIES=2
+TAILOR_MAX_RETRIES=2
+TAILOR_LLM_MAX_TOKENS=6144
+COVER_MAX_RETRIES=2
+COVER_LLM_MAX_TOKENS=2200
+```
+
+These settings keep one bad Opus request from turning into a silent hour-long
+wait. Lowering them saves money and time, but it also gives the model fewer
+chances to repair a bad JSON response.
+
 ## Commands
 
 Run the audit before applying:
