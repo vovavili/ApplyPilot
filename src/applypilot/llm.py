@@ -64,8 +64,43 @@ def _detect_provider() -> tuple[str, str, str]:
 # Client
 # ---------------------------------------------------------------------------
 
-_MAX_RETRIES = 5
-_TIMEOUT = 120  # seconds
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        return max(int(value), minimum)
+    except ValueError:
+        log.warning("Invalid %s=%r; using %s", name, value, default)
+        return default
+
+
+def _env_float(name: str, default: float, minimum: float = 1.0) -> float:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        return max(float(value), minimum)
+    except ValueError:
+        log.warning("Invalid %s=%r; using %s", name, value, default)
+        return default
+
+
+def _llm_timeout() -> httpx.Timeout:
+    timeout = _env_float("APPLYPILOT_LLM_TIMEOUT_SECONDS", 90.0, minimum=10.0)
+    return httpx.Timeout(
+        timeout=timeout,
+        connect=min(20.0, timeout),
+        read=timeout,
+        write=min(30.0, timeout),
+        pool=20.0,
+    )
+
+
+def _max_retries() -> int:
+    return _env_int("APPLYPILOT_LLM_MAX_RETRIES", 3, minimum=1)
+
 
 # Base wait on first 429/503 (doubles each retry, caps at 60s).
 # Gemini free tier is 15 RPM = 4s minimum between requests; 10s gives headroom.
@@ -89,7 +124,7 @@ class LLMClient:
         self.base_url = base_url
         self.model = model
         self.api_key = api_key
-        self._client = httpx.Client(timeout=_TIMEOUT)
+        self._client = httpx.Client(timeout=_llm_timeout())
         # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
@@ -135,6 +170,7 @@ class LLMClient:
             payload["systemInstruction"] = {"parts": system_parts}
 
         url = f"{_GEMINI_NATIVE_BASE}/models/{self.model}:generateContent"
+        log.info("LLM request started: Gemini native model=%s max_tokens=%d", self.model, max_tokens)
         resp = self._client.post(
             url,
             json=payload,
@@ -165,6 +201,7 @@ class LLMClient:
             "max_tokens": max_tokens,
         }
 
+        log.info("LLM request started: %s model=%s max_tokens=%d", self.base_url, self.model, max_tokens)
         resp = self._client.post(
             f"{self.base_url}/chat/completions",
             json=payload,
@@ -200,7 +237,8 @@ class LLMClient:
             if first.get("role") == "user" and not first["content"].startswith("/no_think"):
                 messages = [{"role": first["role"], "content": f"/no_think\n{first['content']}"}] + messages[1:]
 
-        for attempt in range(_MAX_RETRIES):
+        max_retries = _max_retries()
+        for attempt in range(max_retries):
             try:
                 # Route to native Gemini if we've already confirmed it's needed
                 if self._use_native_gemini:
@@ -229,7 +267,7 @@ class LLMClient:
 
             except httpx.HTTPStatusError as exc:
                 resp = exc.response
-                if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
+                if resp.status_code in (429, 503) and attempt < max_retries - 1:
                     # Respect Retry-After header if provided (Gemini sends this).
                     retry_after = resp.headers.get("Retry-After") or resp.headers.get("X-RateLimit-Reset-Requests")
                     if retry_after:
@@ -247,20 +285,20 @@ class LLMClient:
                         resp.status_code,
                         wait,
                         attempt + 1,
-                        _MAX_RETRIES,
+                        max_retries,
                     )
                     time.sleep(wait)
                     continue
                 raise
 
             except httpx.TimeoutException:
-                if attempt < _MAX_RETRIES - 1:
+                if attempt < max_retries - 1:
                     wait = min(_RATE_LIMIT_BASE_WAIT * (2**attempt), 60)
                     log.warning(
                         "LLM request timed out, retrying in %ds (attempt %d/%d)",
                         wait,
                         attempt + 1,
-                        _MAX_RETRIES,
+                        max_retries,
                     )
                     time.sleep(wait)
                     continue
@@ -291,7 +329,7 @@ class AnthropicLLMClient:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
-        self._client = httpx.Client(timeout=_TIMEOUT)
+        self._client = httpx.Client(timeout=_llm_timeout())
 
     def chat(
         self,
@@ -317,8 +355,12 @@ class AnthropicLLMClient:
         if system_parts:
             payload["system"] = "\n\n".join(system_parts)
 
-        for attempt in range(_MAX_RETRIES):
+        max_retries = _max_retries()
+        for attempt in range(max_retries):
             try:
+                log.info(
+                    "LLM request started: %s/v1/messages model=%s max_tokens=%d", self.base_url, self.model, max_tokens
+                )
                 response = self._client.post(
                     f"{self.base_url}/v1/messages",
                     headers={
@@ -341,14 +383,14 @@ class AnthropicLLMClient:
 
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
-                if status in (429, 503) and attempt < _MAX_RETRIES - 1:
+                if status in (429, 503) and attempt < max_retries - 1:
                     wait = _anthropic_wait_seconds(exc.response, attempt)
                     log.warning(
                         "Anthropic LLM rate limited (HTTP %s). Waiting %ds before retry %d/%d.",
                         status,
                         wait,
                         attempt + 1,
-                        _MAX_RETRIES,
+                        max_retries,
                     )
                     time.sleep(wait)
                     continue
@@ -357,13 +399,13 @@ class AnthropicLLMClient:
                 ) from exc
 
             except httpx.TimeoutException:
-                if attempt < _MAX_RETRIES - 1:
+                if attempt < max_retries - 1:
                     wait = min(_RATE_LIMIT_BASE_WAIT * (2**attempt), 60)
                     log.warning(
                         "Anthropic LLM request timed out, retrying in %ds (attempt %d/%d)",
                         wait,
                         attempt + 1,
-                        _MAX_RETRIES,
+                        max_retries,
                     )
                     time.sleep(wait)
                     continue

@@ -50,6 +50,25 @@ def _tailor_provider_override() -> str:
     return os.environ.get("TAILOR_LLM_PROVIDER", "").strip().casefold()
 
 
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        return max(int(value), minimum)
+    except ValueError:
+        log.warning("Invalid %s=%r; using %s", name, value, default)
+        return default
+
+
+def _tailor_max_retries() -> int:
+    return _env_int("TAILOR_MAX_RETRIES", 3, minimum=0)
+
+
+def _tailor_max_tokens() -> int:
+    return _env_int("TAILOR_LLM_MAX_TOKENS", 6144, minimum=2048)
+
+
 def _is_claude_model(model: str) -> bool:
     normalized = model.strip().casefold()
     return normalized.startswith(("claude-", "anthropic/claude-"))
@@ -499,7 +518,7 @@ def tailor_resume(
     resume_text: str,
     job: dict,
     profile: dict,
-    max_retries: int = 3,
+    max_retries: int | None = None,
     validation_mode: str = "normal",
 ) -> tuple[str, dict]:
     """Generate a tailored resume via JSON output + fresh context on each retry.
@@ -523,6 +542,9 @@ def tailor_resume(
     Returns:
         (tailored_text, report) where report contains validation details.
     """
+    if max_retries is None:
+        max_retries = _tailor_max_retries()
+
     job_text = (
         f"TITLE: {job['title']}\n"
         f"COMPANY: {job['site']}\n"
@@ -547,6 +569,7 @@ def tailor_resume(
     client = _get_tailor_client()
     report["model"] = getattr(client, "model", None)
     tailor_prompt_base = _build_tailor_prompt(profile)
+    max_tokens = _tailor_max_tokens()
 
     for attempt in range(max_retries + 1):
         report["attempts"] = attempt + 1
@@ -566,7 +589,37 @@ def tailor_resume(
             },
         ]
 
-        raw = client.chat(messages, max_tokens=8192, temperature=0.4)
+        attempt_started = time.time()
+        emit_event(
+            "tailor_attempt_started",
+            stage="tailor",
+            job_title=job.get("title"),
+            site=job.get("site"),
+            job_url=job.get("url"),
+            attempt=attempt + 1,
+            max_attempts=max_retries + 1,
+            model=report["model"],
+            max_tokens=max_tokens,
+        )
+        log.info(
+            "Tailor attempt %d/%d started | %s | %s",
+            attempt + 1,
+            max_retries + 1,
+            job.get("title", "Untitled"),
+            job.get("site", "Unknown"),
+        )
+
+        raw = client.chat(messages, max_tokens=max_tokens, temperature=0.4)
+        emit_event(
+            "tailor_attempt_response",
+            stage="tailor",
+            job_title=job.get("title"),
+            site=job.get("site"),
+            job_url=job.get("url"),
+            attempt=attempt + 1,
+            elapsed_seconds=round(time.time() - attempt_started, 1),
+            raw_chars=len(raw),
+        )
 
         # Parse JSON from response
         try:
@@ -578,6 +631,17 @@ def tailor_resume(
                     "error": str(e),
                     "raw_excerpt": raw[:500],
                 }
+            )
+            emit_event(
+                "tailor_attempt_invalid_json",
+                level="warning",
+                stage="tailor",
+                job_title=job.get("title"),
+                site=job.get("site"),
+                job_url=job.get("url"),
+                attempt=attempt + 1,
+                error=str(e),
+                raw_chars=len(raw),
             )
             avoid_notes.append("Output was not valid JSON. Return ONLY a JSON object, nothing else.")
             continue
@@ -660,6 +724,22 @@ def run_tailoring(min_score: int = 7, limit: int = 20, validation_mode: str = "n
     for job in jobs:
         completed += 1
         try:
+            emit_event(
+                "tailor_job_started",
+                stage="tailor",
+                job_title=job.get("title"),
+                site=job.get("site"),
+                job_url=job.get("url"),
+                index=completed,
+                total=len(jobs),
+            )
+            log.info(
+                "%d/%d starting | %s | %s",
+                completed,
+                len(jobs),
+                job.get("title", "Untitled"),
+                job.get("site", "Unknown"),
+            )
             tailored, report = tailor_resume(resume_text, job, profile, validation_mode=validation_mode)
 
             prefix = _job_file_prefix(job)

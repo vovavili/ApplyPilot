@@ -91,8 +91,15 @@ def test_tailoring_invalid_json_emits_structured_failure(monkeypatch, tmp_path):
     result = tailor.run_tailoring(limit=1, validation_mode="lenient")
     written = _read_events(log_path)
     failure = next(event for event in written if event["event"] == "tailor_job_failed")
+    started_attempts = [event for event in written if event["event"] == "tailor_attempt_started"]
+    invalid_attempts = [event for event in written if event["event"] == "tailor_attempt_invalid_json"]
 
     assert result["failed"] == 1
+    assert len(started_attempts) == 4
+    assert len(invalid_attempts) == 4
+    assert started_attempts[0]["job_url"] == "https://example.com/job"
+    assert started_attempts[0]["attempt"] == 1
+    assert started_attempts[0]["max_attempts"] == 4
     assert failure["run_id"] == "tailor-test"
     assert failure["stage"] == "tailor"
     assert failure["status"] == "invalid_json"
