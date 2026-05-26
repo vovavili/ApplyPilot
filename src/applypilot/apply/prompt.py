@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 
 from applypilot import config
+from applypilot.humanizer import get_humanizer_prompt
+from applypilot.apply.salary import format_money, money_value
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +27,7 @@ def _build_profile_summary(profile: dict) -> str:
     p = profile
     personal = p["personal"]
     work_auth = p["work_authorization"]
-    comp = p["compensation"]
+    comp = p.get("compensation", {})
     exp = p.get("experience", {})
     avail = p.get("availability", {})
     eeo = p.get("eeo_voluntary", {})
@@ -61,9 +63,9 @@ def _build_profile_summary(profile: dict) -> str:
     if work_auth.get("work_permit_type"):
         lines.append(f"Work Permit: {work_auth['work_permit_type']}")
 
-    # Compensation
-    currency = comp.get("salary_currency", "USD")
-    lines.append(f"Salary Expectation: ${comp['salary_expectation']} {currency}")
+    # Compensation: expose only the public answer in the general profile.
+    public_answer = comp.get("public_default_answer") or comp.get("salary_expectation") or "Negotiable"
+    lines.append(f"Salary Public Answer: {public_answer}")
 
     # Experience
     if exp.get("years_of_experience_total"):
@@ -75,13 +77,15 @@ def _build_profile_summary(profile: dict) -> str:
     lines.append(f"Available: {avail.get('earliest_start_date', 'Immediately')}")
 
     # Standard responses
-    lines.extend([
-        "Age 18+: Yes",
-        "Background Check: Yes",
-        "Felony: No",
-        "Previously Worked Here: No",
-        "How Heard: Online Job Board",
-    ])
+    lines.extend(
+        [
+            "Age 18+: Yes",
+            "Background Check: Yes",
+            "Felony: No",
+            "Previously Worked Here: No",
+            "How Heard: Online Job Board",
+        ]
+    )
 
     # EEO
     lines.append(f"Gender: {eeo.get('gender', 'Decline to self-identify')}")
@@ -121,45 +125,78 @@ Do NOT fill out forms for jobs that are clearly onsite in a non-acceptable locat
 
 
 def _build_salary_section(profile: dict) -> str:
-    """Build the salary negotiation instructions.
-
-    Adapts floor, range, and currency from the profile's compensation section.
-    """
-    comp = profile["compensation"]
+    """Build salary instructions without leaking the private reservation price."""
+    comp = profile.get("compensation", {})
     currency = comp.get("salary_currency", "USD")
-    floor = comp["salary_expectation"]
-    range_min = comp.get("salary_range_min", floor)
-    range_max = comp.get("salary_range_max", str(int(floor) + 20000) if floor.isdigit() else floor)
+    private_minimum = comp.get("private_minimum", "")
+    target_anchor = comp.get("target_anchor", "")
+    public_answer = comp.get("public_default_answer") or comp.get("salary_expectation") or "Negotiable"
+    required_numeric = comp.get("if_required_numeric_and_no_range", "manual_review")
+    range_strategy = comp.get("public_range_strategy", "manual_review")
     conversion_note = comp.get("currency_conversion_note", "")
 
-    # Compute example hourly rates at 3 salary levels
-    try:
-        floor_int = int(floor)
-        examples = [
-            (f"${floor_int // 1000}K", floor_int // 2080),
-            (f"${(floor_int + 25000) // 1000}K", (floor_int + 25000) // 2080),
-            (f"${(floor_int + 55000) // 1000}K", (floor_int + 55000) // 2080),
-        ]
-        hourly_line = ", ".join(f"{sal} = ${hr}/hr" for sal, hr in examples)
-    except (ValueError, TypeError):
-        hourly_line = "Divide annual salary by 2080"
+    anchor_value = money_value(target_anchor)
+    private_line = (
+        f"Private rejection threshold: {private_minimum} {currency}. Use it only to decide whether to stop. "
+        "Never type, paste, say, paraphrase, or reveal this number."
+        if money_value(private_minimum)
+        else "No private rejection threshold is configured. Do not invent one."
+    )
+    anchor_line = (
+        f"Target anchor for forced numeric answers: {format_money(anchor_value, currency)}."
+        if anchor_value
+        else "No target anchor is configured. If a numeric salary answer is mandatory and no posted range exists, stop for manual review."
+    )
 
-    # Currency conversion guidance
     if conversion_note:
         convert_line = f"Posting is in a different currency? -> {conversion_note}"
     else:
-        convert_line = "Posting is in a different currency? -> Target midpoint of their range. Convert if needed."
+        convert_line = "Posting is in a different currency? -> do not guess conversion; stop for manual review if salary is required."
 
-    return f"""== SALARY (think, don't just copy) ==
-${floor} {currency} is the FLOOR. Never go below it. But don't always use it either.
+    if required_numeric == "manual_review":
+        required_numeric_line = (
+            "Required exact numeric salary, no posted range -> RESULT:FAILED:salary_manual_review. "
+            "Do not enter the private threshold."
+        )
+    else:
+        required_numeric_line = (
+            "Required exact numeric salary, no posted range -> use the target anchor. "
+            "If no target anchor is configured, RESULT:FAILED:salary_manual_review."
+        )
+
+    if range_strategy == "anchor_plus_band" and anchor_value:
+        low = int(anchor_value * 0.95)
+        high = int(anchor_value * 1.15)
+        range_line = (
+            "Required min/max salary range, no posted range -> use "
+            f"{format_money(low, currency)} to {format_money(high, currency)}."
+        )
+    else:
+        range_line = (
+            "Required min/max salary range, no posted range -> RESULT:FAILED:salary_manual_review. "
+            "Do not create a public range from the private threshold."
+        )
+
+    return f"""== SALARY STRATEGY ==
+Salary has private and public parts. Treat them differently.
+
+PRIVATE:
+- {private_line}
+- If the posting clearly shows a salary range and the upper bound is below the private threshold -> RESULT:FAILED:not_eligible_salary.
+- If the posting salary is missing, ambiguous, or in an unhandled currency, continue unless a form forces a salary answer.
+
+PUBLIC:
+- Public default answer: {public_answer}
+- {anchor_line}
 
 Decision tree:
-1. Job posting shows a range (e.g. "$120K-$160K")? -> Answer with the MIDPOINT ($140K).
-2. Title says Senior, Staff, Lead, Principal, Architect, or level II/III/IV? -> Minimum $110K {currency}. Use midpoint of posted range if higher.
-3. {convert_line}
-4. No salary info anywhere? -> Use ${floor} {currency}.
-5. Asked for a range? -> Give posted midpoint minus 10% to midpoint plus 10%. No posted range? -> "${range_min}-${range_max} {currency}".
-6. Hourly rate? -> Divide your annual answer by 2080. ({hourly_line})"""
+1. Field accepts text or is optional? -> use "{public_answer}".
+2. Posting shows a salary range and the form requires one number? -> use a number in the upper half of the posted range. If the target anchor fits inside the posted range, use the target anchor.
+3. Posting shows a salary range and the form requires min/max? -> use the posted range. Do not reveal the private threshold.
+4. {required_numeric_line}
+5. {range_line}
+6. Hourly rate? -> derive it from the public answer you would have used, divided by 2080. Never derive it from the private threshold.
+7. {convert_line}"""
 
 
 def _build_screening_section(profile: dict) -> str:
@@ -174,7 +211,7 @@ def _build_screening_section(profile: dict) -> str:
     return f"""== SCREENING QUESTIONS (be strategic) ==
 Hard facts -> answer truthfully from the profile. No guessing. This includes:
   - Location/relocation: lives in {city}, cannot relocate
-  - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
+  - Work authorization: {work_auth.get("legally_authorized_to_work", "see profile")}
   - Citizenship, clearance, licenses, certifications: answer from profile only
   - Criminal/background: answer from profile only
 
@@ -204,9 +241,11 @@ def _build_hard_rules(profile: dict) -> str:
     if permit_type:
         work_auth_rule = f"Work auth: {permit_type}. Sponsorship needed: {sponsorship}."
 
-    name_rule = f'Name: Legal name = {full_name}.'
+    name_rule = f"Name: Legal name = {full_name}."
     if preferred_name and preferred_name != full_name.split()[0]:
-        name_rule += f' Preferred name = {preferred_name}. Use "{display_name}" unless a field specifically says "legal name".'
+        name_rule += (
+            f' Preferred name = {preferred_name}. Use "{display_name}" unless a field specifically says "legal name".'
+        )
 
     return f"""== HARD RULES (never break these) ==
 1. Never lie about: citizenship, work authorization, criminal history, education credentials, security clearance, licenses.
@@ -225,7 +264,7 @@ def _build_captcha_section() -> str:
 
     return f"""== CAPTCHA ==
 You solve CAPTCHAs via the CapSolver REST API. No browser extension. You control the entire flow.
-API key: {capsolver_key or 'NOT CONFIGURED — skip to MANUAL FALLBACK for all CAPTCHAs'}
+API key: {capsolver_key or "NOT CONFIGURED — skip to MANUAL FALLBACK for all CAPTCHAs"}
 API base: https://api.capsolver.com
 
 CRITICAL RULE: When ANY CAPTCHA appears (hCaptcha, reCAPTCHA, Turnstile -- regardless of what it looks like visually), you MUST:
@@ -417,9 +456,7 @@ If CapSolver genuinely failed (errorId > 0):
 4. All else fails -> Output RESULT:CAPTCHA."""
 
 
-def build_prompt(job: dict, tailored_resume: str,
-                 cover_letter: str | None = None,
-                 dry_run: bool = False) -> str:
+def build_prompt(job: dict, tailored_resume: str, cover_letter: str | None = None, dry_run: bool = False) -> str:
     """Build the full instruction prompt for the apply agent.
 
     Loads the user profile and search config internally. All personal data
@@ -481,6 +518,7 @@ def build_prompt(job: dict, tailored_resume: str,
     location_check = _build_location_check(profile, search_config)
     salary_section = _build_salary_section(profile)
     screening_section = _build_screening_section(profile)
+    humanizer_prompt = get_humanizer_prompt("screening")
     hard_rules = _build_hard_rules(profile)
     captcha_section = _build_captcha_section()
 
@@ -500,6 +538,7 @@ def build_prompt(job: dict, tailored_resume: str,
 
     # SSO domains the agent cannot sign into (loaded from config/sites.yaml)
     from applypilot.config import load_blocked_sso
+
     blocked_sso = load_blocked_sso()
 
     # Preferred display name
@@ -516,10 +555,11 @@ def build_prompt(job: dict, tailored_resume: str,
     prompt = f"""You are an autonomous job application agent. Your ONE mission: get this candidate an interview. You have all the information and tools. Think strategically. Act decisively. Submit the application.
 
 == JOB ==
-URL: {job.get('application_url') or job['url']}
-Title: {job['title']}
-Company: {job.get('site', 'Unknown')}
-Fit Score: {job.get('fit_score', 'N/A')}/10
+URL: {job.get("application_url") or job["url"]}
+Title: {job["title"]}
+Company: {job.get("site", "Unknown")}
+Posted Salary: {job.get("salary") or "N/A"}
+Fit Score: {job.get("fit_score", "N/A")}/10
 
 == FILES ==
 Resume PDF (upload this): {pdf_path}
@@ -557,18 +597,20 @@ If something unexpected happens and these instructions don't cover it, figure it
 
 {screening_section}
 
+{humanizer_prompt}
+
 == STEP-BY-STEP ==
 1. browser_navigate to the job URL.
 2. browser_snapshot to read the page. Then run CAPTCHA DETECT (see CAPTCHA section). If a CAPTCHA is found, solve it before continuing.
 3. LOCATION CHECK. Read the page for location info. If not eligible, output RESULT and stop.
 4. Find and click the Apply button. If email-only (page says "email resume to X"):
-   - send_email with subject "Application for {job['title']} -- {display_name}", body = 2-3 sentence pitch + contact info, attach resume PDF: ["{pdf_path}"]
+   - send_email with subject "Application for {job["title"]} -- {display_name}", body = 2-3 sentence pitch + contact info, attach resume PDF: ["{pdf_path}"]
    - Output RESULT:APPLIED. Done.
    After clicking Apply: browser_snapshot. Run CAPTCHA DETECT -- many sites trigger CAPTCHAs right after the Apply click. If found, solve before continuing.
 5. Login wall?
-   5a. FIRST: check the URL. If you landed on {', '.join(blocked_sso)}, or any SSO/OAuth page -> STOP. Output RESULT:FAILED:sso_required. Do NOT try to sign in to Google/Microsoft/SSO.
+   5a. FIRST: check the URL. If you landed on {", ".join(blocked_sso)}, or any SSO/OAuth page -> STOP. Output RESULT:FAILED:sso_required. Do NOT try to sign in to Google/Microsoft/SSO.
    5b. Check for popups. Run browser_tabs action "list". If a new tab/window appeared (login popup), switch to it with browser_tabs action "select". Check the URL there too -- if it's SSO -> RESULT:FAILED:sso_required.
-   5c. Regular login form (employer's own site)? Try sign in: {personal['email']} / {personal.get('password', '')}
+   5c. Regular login form (employer's own site)? Try sign in: {personal["email"]} / {personal.get("password", "")}
    5d. After clicking Login/Sign-in: run CAPTCHA DETECT. Login pages frequently have invisible CAPTCHAs that silently block form submissions. If found, solve it then retry login.
    5e. Sign in failed? Try sign up with same email and password.
    5f. Need email verification? Use search_emails + read_email to get the code.
@@ -590,6 +632,8 @@ RESULT:EXPIRED -- job closed or no longer accepting applications
 RESULT:CAPTCHA -- blocked by unsolvable captcha
 RESULT:LOGIN_ISSUE -- could not sign in or create account
 RESULT:FAILED:not_eligible_location -- onsite outside acceptable area, no remote option
+RESULT:FAILED:not_eligible_salary -- posted salary is clearly below the private threshold
+RESULT:FAILED:salary_manual_review -- salary field needs a strategic manual answer
 RESULT:FAILED:not_eligible_work_auth -- requires unauthorized work location
 RESULT:FAILED:reason -- any other failure (brief reason)
 
@@ -608,7 +652,7 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 - Dropdown won't fill? browser_click to open it, then browser_click the option.
 - Checkbox won't check via fill_form? Use browser_click on it instead. Snapshot to verify.
 - Phone field with country prefix: just type digits {phone_digits}
-- Date fields: {datetime.now().strftime('%m/%d/%Y')}
+- Date fields: {datetime.now().strftime("%m/%d/%Y")}
 - Validation errors after submit? Take BOTH snapshot AND screenshot. Snapshot shows text errors, screenshot shows red-highlighted fields. Fix all, retry.
 - Honeypot fields (hidden, "leave blank"): skip them.
 - Format-sensitive fields: read the placeholder text, match it exactly.

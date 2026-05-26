@@ -5,6 +5,7 @@ Auto-detects provider from environment:
   GEMINI_API_KEY  -> Google Gemini (default: gemini-2.0-flash)
   OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
   LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
+  ANTHROPIC_API_KEY -> Claude, used explicitly by cover-letter overrides
 
 LLM_MODEL env var overrides the model name for any provider.
 """
@@ -20,6 +21,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Provider detection
 # ---------------------------------------------------------------------------
+
 
 def _detect_provider() -> tuple[str, str, str]:
     """Return (base_url, model, api_key) based on environment variables.
@@ -54,8 +56,7 @@ def _detect_provider() -> tuple[str, str, str]:
         )
 
     raise RuntimeError(
-        "No LLM provider configured. "
-        "Set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
+        "No LLM provider configured. Set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
     )
 
 
@@ -207,7 +208,7 @@ class LLMClient:
 
                 return self._chat_compat(messages, temperature, max_tokens)
 
-            except _GeminiCompatForbidden as exc:
+            except _GeminiCompatForbidden:
                 # Model not available on OpenAI-compat layer — switch to native.
                 log.warning(
                     "Gemini compat endpoint returned 403 for model '%s'. "
@@ -230,23 +231,23 @@ class LLMClient:
                 resp = exc.response
                 if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
                     # Respect Retry-After header if provided (Gemini sends this).
-                    retry_after = (
-                        resp.headers.get("Retry-After")
-                        or resp.headers.get("X-RateLimit-Reset-Requests")
-                    )
+                    retry_after = resp.headers.get("Retry-After") or resp.headers.get("X-RateLimit-Reset-Requests")
                     if retry_after:
                         try:
                             wait = float(retry_after)
                         except (ValueError, TypeError):
-                            wait = _RATE_LIMIT_BASE_WAIT * (2 ** attempt)
+                            wait = _RATE_LIMIT_BASE_WAIT * (2**attempt)
                     else:
-                        wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
+                        wait = min(_RATE_LIMIT_BASE_WAIT * (2**attempt), 60)
 
                     log.warning(
                         "LLM rate limited (HTTP %s). Waiting %ds before retry %d/%d. "
                         "Tip: Gemini free tier = 15 RPM. Consider a paid account "
                         "or switching to a local model.",
-                        resp.status_code, wait, attempt + 1, _MAX_RETRIES,
+                        resp.status_code,
+                        wait,
+                        attempt + 1,
+                        _MAX_RETRIES,
                     )
                     time.sleep(wait)
                     continue
@@ -254,10 +255,12 @@ class LLMClient:
 
             except httpx.TimeoutException:
                 if attempt < _MAX_RETRIES - 1:
-                    wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
+                    wait = min(_RATE_LIMIT_BASE_WAIT * (2**attempt), 60)
                     log.warning(
                         "LLM request timed out, retrying in %ds (attempt %d/%d)",
-                        wait, attempt + 1, _MAX_RETRIES,
+                        wait,
+                        attempt + 1,
+                        _MAX_RETRIES,
                     )
                     time.sleep(wait)
                     continue
@@ -275,9 +278,111 @@ class LLMClient:
 
 class _GeminiCompatForbidden(Exception):
     """Sentinel: Gemini OpenAI-compat returned 403. Switch to native API."""
+
     def __init__(self, response: httpx.Response) -> None:
         self.response = response
         super().__init__(f"Gemini compat 403: {response.text[:200]}")
+
+
+class AnthropicLLMClient:
+    """Small Anthropic Messages API client with the same chat() shape."""
+
+    def __init__(self, model: str, api_key: str, base_url: str = "https://api.anthropic.com") -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self._client = httpx.Client(timeout=_TIMEOUT)
+
+    def chat(
+        self,
+        messages: list[dict],
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+    ) -> str:
+        system_parts: list[str] = []
+        anthropic_messages: list[dict] = []
+        for message in messages:
+            role = message.get("role")
+            content = str(message.get("content") or "")
+            if role == "system":
+                system_parts.append(content)
+            elif role in {"user", "assistant"}:
+                anthropic_messages.append({"role": role, "content": content})
+
+        payload: dict = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": anthropic_messages,
+        }
+        if system_parts:
+            payload["system"] = "\n\n".join(system_parts)
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                response = self._client.post(
+                    f"{self.base_url}/v1/messages",
+                    headers={
+                        "content-type": "application/json",
+                        "x-api-key": self.api_key,
+                        "anthropic-version": "2023-06-01",
+                    },
+                    json=payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+                text_parts = [
+                    block.get("text", "")
+                    for block in data.get("content", [])
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ]
+                if not text_parts:
+                    raise KeyError("content")
+                return "\n".join(text_parts).strip()
+
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status in (429, 503) and attempt < _MAX_RETRIES - 1:
+                    wait = _anthropic_wait_seconds(exc.response, attempt)
+                    log.warning(
+                        "Anthropic LLM rate limited (HTTP %s). Waiting %ds before retry %d/%d.",
+                        status,
+                        wait,
+                        attempt + 1,
+                        _MAX_RETRIES,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(
+                    f"Anthropic LLM request failed with HTTP {status}: {exc.response.text[:500]}"
+                ) from exc
+
+            except httpx.TimeoutException:
+                if attempt < _MAX_RETRIES - 1:
+                    wait = min(_RATE_LIMIT_BASE_WAIT * (2**attempt), 60)
+                    log.warning(
+                        "Anthropic LLM request timed out, retrying in %ds (attempt %d/%d)",
+                        wait,
+                        attempt + 1,
+                        _MAX_RETRIES,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
+
+        raise RuntimeError("Anthropic LLM request failed after all retries")
+
+    def close(self) -> None:
+        self._client.close()
+
+
+def _anthropic_wait_seconds(response: httpx.Response, attempt: int) -> float:
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return float(retry_after)
+        except (ValueError, TypeError):
+            pass
+    return min(_RATE_LIMIT_BASE_WAIT * (2**attempt), 60)
 
 
 # ---------------------------------------------------------------------------
@@ -287,11 +392,27 @@ class _GeminiCompatForbidden(Exception):
 _instance: LLMClient | None = None
 
 
+def make_client(model: str | None = None) -> LLMClient:
+    """Create a fresh client, optionally overriding only the model name."""
+    base_url, default_model, api_key = _detect_provider()
+    chosen_model = model or default_model
+    log.info("LLM provider: %s  model: %s", base_url, chosen_model)
+    return LLMClient(base_url, chosen_model, api_key)
+
+
+def make_anthropic_client(model: str | None = None) -> AnthropicLLMClient:
+    """Create a fresh Anthropic client for task-specific Claude overrides."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("A Claude model override is configured, but ANTHROPIC_API_KEY is not configured.")
+    chosen_model = model or os.environ.get("ANTHROPIC_MODEL") or "claude-opus-4-7"
+    log.info("LLM provider: https://api.anthropic.com  model: %s", chosen_model)
+    return AnthropicLLMClient(chosen_model, api_key)
+
+
 def get_client() -> LLMClient:
     """Return (or create) the module-level LLMClient singleton."""
     global _instance
     if _instance is None:
-        base_url, model, api_key = _detect_provider()
-        log.info("LLM provider: %s  model: %s", base_url, model)
-        _instance = LLMClient(base_url, model, api_key)
+        _instance = make_client()
     return _instance

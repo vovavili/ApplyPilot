@@ -90,6 +90,12 @@ employers:
     site_id: "jobs"
     base_url: "https://paypal.wd1.myworkdayjobs.com"
 
+  kyndryl:
+    name: "Kyndryl"
+    tenant: "kyndryl"
+    site_id: "KyndrylProfessionalCareers"
+    base_url: "https://kyndryl.wd5.myworkdayjobs.com"
+
   # ── Canadian Pension Funds ──────────────────────────────────────────────
 
   cppib:
@@ -225,6 +231,12 @@ employers:
     tenant: "uber"
     site_id: "uberCareers"
     base_url: "https://uber.wd5.myworkdayjobs.com"
+
+  vanderlande:
+    name: "Vanderlande"
+    tenant: "vanderlande"
+    site_id: "careers"
+    base_url: "https://vanderlande.wd3.myworkdayjobs.com"
 
   # ── Consulting ──────────────────────────────────────────────────────────
 

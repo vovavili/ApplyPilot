@@ -13,7 +13,6 @@ import json
 import shutil
 from pathlib import Path
 
-import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -34,6 +33,7 @@ console = Console()
 # ---------------------------------------------------------------------------
 # Resume
 # ---------------------------------------------------------------------------
+
 
 def _setup_resume() -> None:
     """Prompt for resume file and copy into APP_DIR."""
@@ -78,9 +78,14 @@ def _setup_resume() -> None:
 # Profile
 # ---------------------------------------------------------------------------
 
+
 def _setup_profile() -> dict:
     """Walk through profile questions and return a nested profile dict."""
-    console.print(Panel("[bold]Step 2: Profile[/bold]\nTell ApplyPilot about yourself. This powers scoring, tailoring, and auto-fill."))
+    console.print(
+        Panel(
+            "[bold]Step 2: Profile[/bold]\nTell ApplyPilot about yourself. This powers scoring, tailoring, and auto-fill."
+        )
+    )
 
     profile: dict = {}
 
@@ -109,26 +114,32 @@ def _setup_profile() -> dict:
     profile["work_authorization"] = {
         "legally_authorized_to_work": Confirm.ask("Are you legally authorized to work in your target country?"),
         "require_sponsorship": Confirm.ask("Will you now or in the future need sponsorship?"),
-        "work_permit_type": Prompt.ask("Work permit type (e.g. Citizen, PR, Open Work Permit — leave blank if N/A)", default=""),
+        "work_permit_type": Prompt.ask(
+            "Work permit type (e.g. Citizen, PR, Open Work Permit — leave blank if N/A)", default=""
+        ),
     }
 
     # -- Compensation --
     console.print("\n[bold cyan]Compensation[/bold cyan]")
-    salary = Prompt.ask("Expected annual salary (number)", default="")
+    private_minimum = Prompt.ask("Private minimum annual salary (never submitted; blank to disable)", default="")
+    public_answer = Prompt.ask("Public default salary answer", default="Negotiable")
+    target_anchor = Prompt.ask("Target anchor if a numeric salary is mandatory", default="")
     salary_currency = Prompt.ask("Currency", default="USD")
-    salary_range = Prompt.ask("Acceptable range (e.g. 80000-120000)", default="")
-    range_parts = salary_range.split("-") if "-" in salary_range else [salary, salary]
     profile["compensation"] = {
-        "salary_expectation": salary,
+        "private_minimum": private_minimum,
+        "target_anchor": target_anchor,
+        "public_default_answer": public_answer,
         "salary_currency": salary_currency,
-        "salary_range_min": range_parts[0].strip(),
-        "salary_range_max": range_parts[1].strip() if len(range_parts) > 1 else range_parts[0].strip(),
+        "if_required_numeric_and_no_range": "manual_review",
+        "public_range_strategy": "manual_review",
     }
 
     # -- Experience --
     console.print("\n[bold cyan]Experience[/bold cyan]")
     current_title = Prompt.ask("Current/most recent job title", default="")
-    target_role = Prompt.ask("Target role (what you're applying for, e.g. 'Senior Backend Engineer')", default=current_title)
+    target_role = Prompt.ask(
+        "Target role (what you're applying for, e.g. 'Senior Backend Engineer')", default=current_title
+    )
     profile["experience"] = {
         "years_of_experience_total": Prompt.ask("Years of professional experience", default=""),
         "education_level": Prompt.ask("Highest education (e.g. Bachelor's, Master's, PhD, Self-taught)", default=""),
@@ -184,6 +195,7 @@ def _setup_profile() -> dict:
 # Search config
 # ---------------------------------------------------------------------------
 
+
 def _setup_searches() -> None:
     """Generate a searches.yaml from user input."""
     console.print(Panel("[bold]Step 3: Job Search Config[/bold]\nDefine what you're looking for."))
@@ -195,9 +207,7 @@ def _setup_searches() -> None:
     except ValueError:
         distance = 0
 
-    roles_raw = Prompt.ask(
-        "Target job titles (comma-separated, e.g. 'Backend Engineer, Full Stack Developer')"
-    )
+    roles_raw = Prompt.ask("Target job titles (comma-separated, e.g. 'Backend Engineer, Full Stack Developer')")
     roles = [r.strip() for r in roles_raw.split(",") if r.strip()]
 
     if not roles:
@@ -219,6 +229,18 @@ def _setup_searches() -> None:
         f'  - location: "{location}"',
         f"    remote: {str(distance == 0).lower()}",
         "",
+        "workday_enabled: true",
+        "workday_allow_broad_crawl: false",
+        "workday_location_filter: true",
+        "workday_location_policy: recall_first",
+        "workday_max_tier: 2",
+        "workday_employers: []",
+        "",
+        "priority_company_sources_enabled: true",
+        "priority_company_max_tier: 3",
+        "priority_company_location_policy: recall_first",
+        "priority_company_sources: []",
+        "",
         "queries:",
     ]
     for i, role in enumerate(roles):
@@ -233,13 +255,16 @@ def _setup_searches() -> None:
 # AI Features
 # ---------------------------------------------------------------------------
 
+
 def _setup_ai_features() -> None:
     """Ask about AI scoring/tailoring — optional LLM configuration."""
-    console.print(Panel(
-        "[bold]Step 4: AI Features (optional)[/bold]\n"
-        "An LLM powers job scoring, resume tailoring, and cover letters.\n"
-        "Without this, you can still discover and enrich jobs."
-    ))
+    console.print(
+        Panel(
+            "[bold]Step 4: AI Features (optional)[/bold]\n"
+            "An LLM powers job scoring, resume tailoring, and cover letters.\n"
+            "Without this, you can still discover and enrich jobs."
+        )
+    )
 
     if not Confirm.ask("Enable AI scoring and resume tailoring?", default=True):
         console.print("[dim]Discovery-only mode. You can configure AI later with [bold]applypilot init[/bold].[/dim]")
@@ -279,13 +304,16 @@ def _setup_ai_features() -> None:
 # Auto-Apply
 # ---------------------------------------------------------------------------
 
+
 def _setup_auto_apply() -> None:
     """Configure autonomous job application (requires Claude Code CLI)."""
-    console.print(Panel(
-        "[bold]Step 5: Auto-Apply (optional)[/bold]\n"
-        "ApplyPilot can autonomously fill and submit job applications\n"
-        "using Claude Code as the browser agent."
-    ))
+    console.print(
+        Panel(
+            "[bold]Step 5: Auto-Apply (optional)[/bold]\n"
+            "ApplyPilot can autonomously fill and submit job applications\n"
+            "using Claude Code as the browser agent."
+        )
+    )
 
     if not Confirm.ask("Enable autonomous job applications?", default=True):
         console.print("[dim]You can apply manually using the tailored resumes ApplyPilot generates.[/dim]")
@@ -323,6 +351,7 @@ def _setup_auto_apply() -> None:
 # ---------------------------------------------------------------------------
 # Main entry
 # ---------------------------------------------------------------------------
+
 
 def run_wizard() -> None:
     """Run the full interactive setup wizard."""
@@ -385,9 +414,7 @@ def run_wizard() -> None:
     console.print(
         Panel.fit(
             "[bold green]Setup complete![/bold green]\n\n"
-            f"[bold]Your tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]\n\n"
-            + "\n".join(tier_lines)
-            + unlock_hint,
+            f"[bold]Your tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]\n\n" + "\n".join(tier_lines) + unlock_hint,
             border_style="green",
         )
     )

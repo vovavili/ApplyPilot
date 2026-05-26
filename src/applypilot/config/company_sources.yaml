@@ -1,0 +1,85 @@
+# Priority company discovery registry for ApplyPilot.
+# Users can override or add entries in ~/.applypilot/company_sources.yaml.
+
+companies:
+  # High-priority custom sources
+  uber:
+    name: "Uber"
+    platform: "uber"
+
+  netflix:
+    name: "Netflix"
+    platform: "netflix"
+
+  # Greenhouse
+  stripe:
+    name: "Stripe"
+    platform: "greenhouse"
+    board: "stripe"
+
+  flow_traders:
+    name: "Flow Traders"
+    platform: "greenhouse"
+    board: "flowtraders"
+
+  jump_trading:
+    name: "Jump Trading"
+    platform: "greenhouse"
+    board: "jumptrading"
+
+  imc:
+    name: "IMC"
+    platform: "greenhouse"
+    board: "imc"
+
+  catawiki:
+    name: "Catawiki"
+    platform: "greenhouse"
+    board: "catawiki"
+
+  bol:
+    name: "Bol.com"
+    platform: "greenhouse"
+    board: "bolcom"
+
+  adyen:
+    name: "Adyen"
+    platform: "greenhouse"
+    board: "adyen"
+
+  elastic:
+    name: "Elastic"
+    platform: "greenhouse"
+    board: "elastic"
+
+  gitlab:
+    name: "GitLab"
+    platform: "greenhouse"
+    board: "gitlab"
+
+  databricks:
+    name: "Databricks"
+    platform: "greenhouse"
+    board: "databricks"
+
+  flexport:
+    name: "Flexport"
+    platform: "greenhouse"
+    board: "flexport"
+
+  # Lever
+  spotify:
+    name: "Spotify"
+    platform: "lever"
+    account: "spotify"
+
+  # Workday bridge
+  kyndryl:
+    name: "Kyndryl"
+    platform: "workday"
+    employer_key: "kyndryl"
+
+  vanderlande:
+    name: "Vanderlande"
+    platform: "workday"
+    employer_key: "vanderlande"

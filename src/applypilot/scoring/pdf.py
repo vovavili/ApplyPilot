@@ -5,14 +5,19 @@ and exports to PDF using headless Chromium via Playwright.
 """
 
 import logging
+import os
 from pathlib import Path
 
-from applypilot.config import TAILORED_DIR
+from applypilot.config import TAILORED_DIR, get_chrome_path, load_env, load_profile
+from applypilot.events import emit_error, emit_event
+from applypilot.scoring.latex_cover_letter import build_latex_cover_letter
+from applypilot.scoring.latex_resume import build_latex_resume, render_latex_pdf
 
 log = logging.getLogger(__name__)
 
 
 # ── Resume Parser ────────────────────────────────────────────────────────
+
 
 def parse_resume(text: str) -> dict:
     """Parse a structured text resume into sections.
@@ -126,9 +131,7 @@ def parse_entries(text: str) -> list[dict]:
             if current:
                 current["bullets"].append(stripped[2:].strip())
         elif current is None or (
-            not stripped.startswith("-")
-            and not stripped.startswith("\u2022")
-            and len(current.get("bullets", [])) > 0
+            not stripped.startswith("-") and not stripped.startswith("\u2022") and len(current.get("bullets", [])) > 0
         ):
             # New entry
             if current:
@@ -147,6 +150,7 @@ def parse_entries(text: str) -> list[dict]:
 
 
 # ── HTML Template ────────────────────────────────────────────────────────
+
 
 def build_html(resume: dict) -> str:
     """Build professional resume HTML from parsed data.
@@ -194,7 +198,9 @@ def build_html(resume: dict) -> str:
     edu_html = ""
     if "EDUCATION" in sections:
         edu_text = sections["EDUCATION"].strip()
-        edu_html = f'<div class="section"><div class="section-title">Education</div><div class="edu">{edu_text}</div></div>'
+        edu_html = (
+            f'<div class="section"><div class="section-title">Education</div><div class="edu">{edu_text}</div></div>'
+        )
 
     # Summary
     summary_html = ""
@@ -317,8 +323,8 @@ li {{
 </head>
 <body>
 <div class="header">
-    <div class="name">{resume['name']}</div>
-    <div class="title">{resume['title']}</div>
+    <div class="name">{resume["name"]}</div>
+    <div class="title">{resume["title"]}</div>
     {location_html}
     <div class="contact">{contact_html}</div>
 </div>
@@ -333,6 +339,7 @@ li {{
 
 # ── PDF Renderer ─────────────────────────────────────────────────────────
 
+
 def render_pdf(html: str, output_path: str) -> None:
     """Render HTML to PDF using Playwright's headless Chromium.
 
@@ -343,7 +350,10 @@ def render_pdf(html: str, output_path: str) -> None:
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        try:
+            browser = p.chromium.launch()
+        except Exception:
+            browser = p.chromium.launch(executable_path=get_chrome_path())
         page = browser.new_page()
         page.set_content(html, wait_until="networkidle")
         page.pdf(
@@ -357,8 +367,14 @@ def render_pdf(html: str, output_path: str) -> None:
 
 # ── Public API ───────────────────────────────────────────────────────────
 
+
 def convert_to_pdf(
-    text_path: Path, output_path: Path | None = None, html_only: bool = False
+    text_path: Path,
+    output_path: Path | None = None,
+    html_only: bool = False,
+    *,
+    job: dict | None = None,
+    profile: dict | None = None,
 ) -> Path:
     """Convert a text resume/cover letter to PDF.
 
@@ -373,6 +389,24 @@ def convert_to_pdf(
     """
     text_path = Path(text_path)
     text = text_path.read_text(encoding="utf-8")
+
+    if _should_use_latex_cover_renderer(text_path, text, html_only):
+        out = Path(output_path or text_path.with_suffix(".pdf"))
+        latex = build_latex_cover_letter(text, profile or _load_profile_or_empty(), job=job)
+        render_latex_pdf(latex, out)
+        log.info("LaTeX cover PDF generated: %s", out)
+        emit_event("pdf_generated", stage="pdf", renderer="latex_cover", source_path=text_path, output_path=out)
+        return out
+
+    if _should_use_latex_resume_renderer(text_path, text, html_only):
+        out = Path(output_path or text_path.with_suffix(".pdf"))
+        resume = parse_resume(text)
+        latex = build_latex_resume(resume, profile or _load_profile_or_empty())
+        render_latex_pdf(latex, out)
+        log.info("LaTeX PDF generated: %s", out)
+        emit_event("pdf_generated", stage="pdf", renderer="latex", source_path=text_path, output_path=out)
+        return out
+
     resume = parse_resume(text)
     html = build_html(resume)
 
@@ -381,13 +415,56 @@ def convert_to_pdf(
         out = Path(out)
         out.write_text(html, encoding="utf-8")
         log.info("HTML generated: %s", out)
+        emit_event("html_generated", stage="pdf", renderer="html", source_path=text_path, output_path=out)
         return out
 
     out = output_path or text_path.with_suffix(".pdf")
     out = Path(out)
     render_pdf(html, str(out))
     log.info("PDF generated: %s", out)
+    emit_event("pdf_generated", stage="pdf", renderer="html", source_path=text_path, output_path=out)
     return out
+
+
+def _should_use_latex_resume_renderer(text_path: Path, text: str, html_only: bool) -> bool:
+    if html_only or _looks_like_cover_letter(text_path, text):
+        return False
+
+    load_env()
+    renderer = os.environ.get("APPLYPILOT_RESUME_RENDERER", "html").strip().lower()
+    return renderer in {"latex", "tex", "latex_cv"}
+
+
+def _should_use_latex_cover_renderer(text_path: Path, text: str, html_only: bool) -> bool:
+    if html_only or not _looks_like_cover_letter(text_path, text):
+        return False
+
+    load_env()
+    renderer = os.environ.get("APPLYPILOT_COVER_RENDERER", "latex").strip().lower()
+    return renderer in {"latex", "tex", "moderncv", "latex_cover"}
+
+
+def _looks_like_cover_letter(text_path: Path, text: str) -> bool:
+    return text_path.name.endswith("_CL.txt") or text.lstrip().lower().startswith("dear ")
+
+
+def _load_profile_or_empty() -> dict:
+    try:
+        return load_profile()
+    except FileNotFoundError:
+        return {}
+
+
+def _eligible_resume_text_paths() -> set[Path]:
+    """Return tailored resume text files that are allowed to advance to PDF."""
+    from applypilot.database import get_connection
+
+    rows = get_connection().execute(
+        "SELECT tailored_resume_path FROM jobs "
+        "WHERE tailored_resume_path IS NOT NULL "
+        "AND COALESCE(review_status, '') != 'manual_review'"
+    )
+    return {Path(row[0]).resolve() for row in rows if row[0]}
 
 
 def batch_convert(limit: int = 50) -> int:
@@ -406,12 +483,10 @@ def batch_convert(limit: int = 50) -> int:
         log.warning("Tailored directory does not exist: %s", TAILORED_DIR)
         return 0
 
+    eligible_paths = _eligible_resume_text_paths()
     txt_files = sorted(TAILORED_DIR.glob("*.txt"))
-    # Exclude _JOB.txt and _CL.txt files from resume conversion
-    # (they get their own conversion calls)
     candidates = [
-        f for f in txt_files
-        if not f.name.endswith("_JOB.txt")
+        f for f in txt_files if not f.name.endswith(("_JOB.txt", "_CL.txt")) and f.resolve() in eligible_paths
     ]
 
     # Filter to those without a corresponding PDF
@@ -435,6 +510,7 @@ def batch_convert(limit: int = 50) -> int:
             converted += 1
         except Exception as e:
             log.error("Failed to convert %s: %s", f.name, e)
+            emit_error("pdf_generation_failed", e, stage="pdf", source_path=f)
 
     log.info("Done: %d/%d PDFs generated in %s", converted, len(to_convert), TAILORED_DIR)
     return converted

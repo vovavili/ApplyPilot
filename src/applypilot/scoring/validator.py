@@ -20,58 +20,145 @@ log = logging.getLogger(__name__)
 # ── Universal Constants (not personal data) ───────────────────────────────
 
 BANNED_WORDS: list[str] = [
-    "passionate", "dedicated", "committed to",
-    "utilizing", "utilize", "harnessing",
-    "spearheaded", "spearhead", "orchestrated", "championed", "pioneered",
-    "robust", "scalable solutions", "cutting-edge", "state-of-the-art", "best-in-class",
-    "proven track record", "track record of success", "demonstrated ability",
-    "strong communicator", "team player", "fast learner", "self-starter", "go-getter",
-    "synergy", "cross-functional collaboration", "holistic",
-    "transformative", "innovative solutions", "paradigm", "ecosystem",
-    "proactive", "detail-oriented", "highly motivated",
-    "seamless", "full lifecycle",
-    "deep understanding", "extensive experience", "comprehensive knowledge",
-    "thrives in", "excels at", "adept at", "well-versed in",
-    "i am confident", "i believe", "i am excited",
-    "plays a critical role", "instrumental in", "integral part of",
-    "strong track record", "eager to", "eager",
+    "passionate",
+    "dedicated",
+    "committed to",
+    "utilizing",
+    "utilize",
+    "harnessing",
+    "spearheaded",
+    "spearhead",
+    "orchestrated",
+    "championed",
+    "pioneered",
+    "robust",
+    "scalable solutions",
+    "cutting-edge",
+    "state-of-the-art",
+    "best-in-class",
+    "proven track record",
+    "track record of success",
+    "demonstrated ability",
+    "strong communicator",
+    "team player",
+    "fast learner",
+    "self-starter",
+    "go-getter",
+    "synergy",
+    "cross-functional collaboration",
+    "holistic",
+    "transformative",
+    "innovative solutions",
+    "paradigm",
+    "ecosystem",
+    "proactive",
+    "detail-oriented",
+    "highly motivated",
+    "seamless",
+    "full lifecycle",
+    "deep understanding",
+    "extensive experience",
+    "comprehensive knowledge",
+    "thrives in",
+    "excels at",
+    "adept at",
+    "well-versed in",
+    "i am confident",
+    "i believe",
+    "i am excited",
+    "plays a critical role",
+    "instrumental in",
+    "integral part of",
+    "strong track record",
+    "eager to",
+    "eager",
     # Cover-letter-specific additions
-    "this demonstrates", "this reflects", "i have experience with",
-    "furthermore", "additionally", "moreover",
+    "this demonstrates",
+    "this reflects",
+    "i have experience with",
+    "furthermore",
+    "additionally",
+    "moreover",
 ]
 
 LLM_LEAK_PHRASES: list[str] = [
-    "i am sorry", "i apologize", "i will try", "let me try",
-    "i am at a loss", "i am truly sorry", "apologies for",
-    "i keep fabricating", "i will have to admit", "one final attempt",
-    "one last time", "if it fails again", "persistent errors",
-    "i am having difficulty", "i made an error", "my mistake",
-    "here is the corrected", "here is the revised", "here is the updated",
-    "here is my", "below is the", "as requested",
-    "note:", "disclaimer:", "important:",
-    "i have rewritten", "i have removed", "i have fixed",
-    "i have replaced", "i have updated", "i have corrected",
-    "per your feedback", "based on your feedback", "as per the instructions",
-    "the following resume", "the resume below",
-    "the following cover letter", "the letter below",
+    "i am sorry",
+    "i apologize",
+    "i will try",
+    "let me try",
+    "i am at a loss",
+    "i am truly sorry",
+    "apologies for",
+    "i keep fabricating",
+    "i will have to admit",
+    "one final attempt",
+    "one last time",
+    "if it fails again",
+    "persistent errors",
+    "i am having difficulty",
+    "i made an error",
+    "my mistake",
+    "here is the corrected",
+    "here is the revised",
+    "here is the updated",
+    "here is my",
+    "below is the",
+    "as requested",
+    "note:",
+    "disclaimer:",
+    "important:",
+    "i have rewritten",
+    "i have removed",
+    "i have fixed",
+    "i have replaced",
+    "i have updated",
+    "i have corrected",
+    "per your feedback",
+    "based on your feedback",
+    "as per the instructions",
+    "the following resume",
+    "the resume below",
+    "the following cover letter",
+    "the letter below",
 ]
 
 # Known fabrication markers: completely unrelated tools/languages.
 # Reasonable stretches (K8s, Terraform, Redis, Kafka etc.) are ALLOWED.
 FABRICATION_WATCHLIST: set[str] = {
     # Languages with zero relation to the candidate's stack
-    "c#", "c++", "golang", "rust", "ruby",
-    "kotlin", "swift", "scala", "matlab",
+    "c#",
+    "c++",
+    "golang",
+    "rust",
+    "ruby",
+    "kotlin",
+    "swift",
+    "scala",
+    "matlab",
     # Frameworks for wrong languages
-    "spring", "django", "rails", "angular", "vue", "svelte",
+    "spring",
+    "django",
+    "rails",
+    "angular",
+    "vue",
+    "svelte",
     # Hard lies: certifications can't be stretched
-    "certif", "certified", "pmp", "scrum master", "aws certified",
+    "certif",
+    "certified",
+    "pmp",
+    "scrum master",
+    "aws certified",
 }
 
 REQUIRED_SECTIONS: set[str] = {"SUMMARY", "TECHNICAL SKILLS", "EXPERIENCE", "PROJECTS", "EDUCATION"}
 
+COVER_LETTER_MIN_WORDS = 170
+COVER_LETTER_TARGET_MAX_WORDS = 285
+COVER_LETTER_HARD_MAX_WORDS = 340
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────
+
 
 def _build_skills_set(profile: dict) -> set[str]:
     """Build the set of allowed skills from the profile's skills_boundary."""
@@ -85,16 +172,31 @@ def _build_skills_set(profile: dict) -> set[str]:
     return allowed
 
 
+def _preserved_school_names(value) -> list[str]:
+    """Return school names that must stay visible in generated resumes.
+
+    Older profiles store multiple schools as one comma-separated string. The
+    validator should require each school, not the exact combined phrase, because
+    resumes often add degree labels between school names.
+    """
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [part.strip() for part in re.split(r"[,;]", value) if part.strip()]
+    return [str(value).strip()] if value else []
+
+
 def sanitize_text(text: str) -> str:
     """Auto-fix common LLM output issues instead of rejecting."""
-    text = text.replace(" \u2014 ", ", ").replace("\u2014", ", ")   # em dash -> comma
-    text = text.replace("\u2013", "-")    # en dash -> hyphen
-    text = text.replace("\u201c", '"').replace("\u201d", '"')   # smart double quotes
-    text = text.replace("\u2018", "'").replace("\u2019", "'")   # smart single quotes
+    text = text.replace(" \u2014 ", ", ").replace("\u2014", ", ")  # em dash -> comma
+    text = text.replace("\u2013", "-")  # en dash -> hyphen
+    text = text.replace("\u201c", '"').replace("\u201d", '"')  # smart double quotes
+    text = text.replace("\u2018", "'").replace("\u2019", "'")  # smart single quotes
     return text.strip()
 
 
 # ── JSON Field Validation ─────────────────────────────────────────────────
+
 
 def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dict:
     """Validate individual JSON fields from an LLM-generated tailored resume.
@@ -114,7 +216,7 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     warnings: list[str] = []
 
     # Required keys — always checked regardless of mode
-    for key in ("title", "summary", "skills", "experience", "projects", "education"):
+    for key in ("title", "summary", "skills", "experience", "education"):
         if key not in data or not data[key]:
             errors.append(f"Missing required field: {key}")
     if errors:
@@ -126,7 +228,10 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     # Skills: check for fabrication (always enforced)
     if isinstance(data["skills"], dict):
         skills_text = " ".join(str(v) for v in data["skills"].values()).lower()
+        allowed_skills = _build_skills_set(profile)
         for fake in FABRICATION_WATCHLIST:
+            if fake in allowed_skills:
+                continue
             if len(fake) <= 2:
                 continue
             if fake in skills_text:
@@ -138,10 +243,7 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
 
     if isinstance(data["experience"], list):
         for company in preserved_companies:
-            has_company = any(
-                company.lower() in str(e.get("header", "")).lower()
-                for e in data["experience"]
-            )
+            has_company = any(company.lower() in str(e.get("header", "")).lower() for e in data["experience"])
             if not has_company:
                 errors.append(f"Company '{company}' missing from experience")
         for entry in data["experience"]:
@@ -149,17 +251,16 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
                 all_text_parts.append(b)
 
     # Projects: collect bullets
-    if isinstance(data["projects"], list):
-        for entry in data["projects"]:
+    if isinstance(data.get("projects", []), list):
+        for entry in data.get("projects", []):
             for b in entry.get("bullets", []):
                 all_text_parts.append(b)
 
     # Education: preserved school must be present (always enforced)
-    preserved_school = resume_facts.get("preserved_school", "")
-    if preserved_school:
-        edu = str(data.get("education", ""))
-        if preserved_school.lower() not in edu.lower():
-            errors.append(f"Education '{preserved_school}' missing")
+    edu = str(data.get("education", "")).lower()
+    for school in _preserved_school_names(resume_facts.get("preserved_school", "")):
+        if school.lower() not in edu:
+            errors.append(f"Education '{school}' missing")
 
     # Bulk text checks
     all_text = " ".join(all_text_parts).lower()
@@ -183,6 +284,7 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
 
 
 # ── Full Resume Text Validation ───────────────────────────────────────────
+
 
 def validate_tailored_resume(text: str, profile: dict, original_text: str = "") -> dict:
     """Programmatic validation of a tailored resume against the user's profile.
@@ -230,9 +332,9 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
             warnings.append(f"Project '{project}' not found -- may have been renamed")
 
     # 5. Check school preserved
-    preserved_school = resume_facts.get("preserved_school", "")
-    if preserved_school and preserved_school.lower() not in text_lower:
-        errors.append(f"Education '{preserved_school}' missing")
+    for school in _preserved_school_names(resume_facts.get("preserved_school", "")):
+        if school.lower() not in text_lower:
+            errors.append(f"Education '{school}' missing")
 
     # 6. Check contact info preserved (warn, don't error -- we can inject)
     email = personal.get("email", "")
@@ -293,7 +395,8 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
 
 # ── Cover Letter Validation ──────────────────────────────────────────────
 
-def validate_cover_letter(text: str, mode: str = "normal") -> dict:
+
+def validate_cover_letter(text: str, mode: str = "normal", expected_signoff: str | None = None) -> dict:
     """Programmatic validation of a cover letter.
 
     Args:
@@ -302,6 +405,8 @@ def validate_cover_letter(text: str, mode: str = "normal") -> dict:
               strict  → banned words are errors (trigger retries); word limit enforced
               normal  → banned words are warnings; word limit is soft (+25 words)
               lenient → banned words ignored; word count not checked
+        expected_signoff: Optional exact final sign-off line, usually the preferred
+                          name from profile.json.
 
     Returns:
         {"passed": bool, "errors": list[str], "warnings": list[str]}
@@ -326,10 +431,12 @@ def validate_cover_letter(text: str, mode: str = "normal") -> dict:
 
     # 3. Word count
     words = len(text.split())
-    if mode == "strict" and words > 250:
-        errors.append(f"Too long ({words} words). Max 250.")
-    elif mode == "normal" and words > 275:
-        warnings.append(f"Long ({words} words). Target 250.")
+    if mode == "strict" and words > COVER_LETTER_TARGET_MAX_WORDS:
+        errors.append(f"Too long ({words} words). Max {COVER_LETTER_TARGET_MAX_WORDS}.")
+    elif mode == "normal" and words > COVER_LETTER_HARD_MAX_WORDS:
+        errors.append(f"Too long ({words} words). Max {COVER_LETTER_HARD_MAX_WORDS}.")
+    elif mode == "normal" and words > COVER_LETTER_TARGET_MAX_WORDS:
+        warnings.append(f"Long ({words} words). Target {COVER_LETTER_TARGET_MAX_WORDS}.")
     # lenient: no word count check
 
     # 4. LLM self-talk — always an error regardless of mode
@@ -339,7 +446,46 @@ def validate_cover_letter(text: str, mode: str = "normal") -> dict:
 
     # 5. Must start with "Dear" — always checked (preamble should have been stripped)
     stripped = text.strip()
-    if not stripped.lower().startswith("dear"):
+    if not stripped.lower().startswith("dear hiring manager"):
         errors.append("Must start with 'Dear Hiring Manager,'")
+
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if expected_signoff:
+        if not lines or lines[-1].casefold() != expected_signoff.strip().casefold():
+            errors.append(f"Must end with sign-off name '{expected_signoff}'")
+
+    has_expected_signoff = bool(
+        expected_signoff and lines and lines[-1].casefold() == expected_signoff.strip().casefold()
+    )
+    body_lines = lines[1:-1] if has_expected_signoff and len(lines) >= 2 else lines[1:]
+    if mode != "lenient" and len(body_lines) < 3:
+        errors.append("Must include three short body paragraphs")
+
+    min_words = COVER_LETTER_MIN_WORDS if mode in {"strict", "normal"} else 0
+    if min_words and words < min_words:
+        errors.append(f"Too short ({words} words). Likely truncated; min {min_words}.")
+
+    if body_lines:
+        last_body_word = re.sub(r"[^a-zA-Z]", "", body_lines[-1].split()[-1]).casefold()
+        dangling = {
+            "a",
+            "an",
+            "and",
+            "as",
+            "because",
+            "by",
+            "for",
+            "from",
+            "in",
+            "into",
+            "of",
+            "that",
+            "the",
+            "this",
+            "to",
+            "with",
+        }
+        if last_body_word in dangling:
+            errors.append(f"Looks truncated; dangling final word '{last_body_word}'")
 
     return {"passed": len(errors) == 0, "errors": errors, "warnings": warnings}

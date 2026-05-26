@@ -93,6 +93,37 @@ boards:
   - zip_recruiter
   - google
 
+# Workday direct ATS discovery. Keep broad crawling off unless you really
+# want to search every packaged Workday employer.
+workday_enabled: true
+workday_allow_broad_crawl: false
+workday_location_filter: true
+workday_location_policy: recall_first
+workday_max_tier: 2
+workday_employers: []
+
+# Curated high-value company career pages. Empty allowlist means skip.
+priority_company_sources_enabled: true
+priority_company_max_tier: 3
+priority_company_location_policy: recall_first
+priority_company_sources:
+  - uber
+  - netflix
+  - stripe
+  - flow_traders
+  - jump_trading
+  - imc
+  - catawiki
+  - bol
+  - adyen
+  - elastic
+  - gitlab
+  - databricks
+  - flexport
+  - spotify
+  - kyndryl
+  - vanderlande
+
 # Search defaults
 defaults:
   results_per_site: 100  # Max results per board per query

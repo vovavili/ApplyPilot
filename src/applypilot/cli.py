@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Optional
 
@@ -33,6 +34,7 @@ VALID_STAGES = ("discover", "enrich", "score", "tailor", "cover", "pdf")
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _bootstrap() -> None:
     """Common setup: load env, create dirs, init DB."""
     from applypilot.config import load_env, ensure_dirs
@@ -53,10 +55,13 @@ def _version_callback(value: bool) -> None:
 # Commands
 # ---------------------------------------------------------------------------
 
+
 @app.callback()
 def main(
     version: bool = typer.Option(
-        False, "--version", "-V",
+        False,
+        "--version",
+        "-V",
         help="Show version and exit.",
         callback=_version_callback,
         is_eager=True,
@@ -77,11 +82,7 @@ def init() -> None:
 def run(
     stages: Optional[list[str]] = typer.Argument(
         None,
-        help=(
-            "Pipeline stages to run. "
-            f"Valid: {', '.join(VALID_STAGES)}, all. "
-            "Defaults to 'all' if omitted."
-        ),
+        help=(f"Pipeline stages to run. Valid: {', '.join(VALID_STAGES)}, all. Defaults to 'all' if omitted."),
     ),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
@@ -108,25 +109,20 @@ def run(
     # Validate stage names
     for s in stage_list:
         if s != "all" and s not in VALID_STAGES:
-            console.print(
-                f"[red]Unknown stage:[/red] '{s}'. "
-                f"Valid stages: {', '.join(VALID_STAGES)}, all"
-            )
+            console.print(f"[red]Unknown stage:[/red] '{s}'. Valid stages: {', '.join(VALID_STAGES)}, all")
             raise typer.Exit(code=1)
 
     # Gate AI stages behind Tier 2
     llm_stages = {"score", "tailor", "cover"}
     if any(s in stage_list for s in llm_stages) or "all" in stage_list:
         from applypilot.config import check_tier
+
         check_tier(2, "AI scoring/tailoring")
 
     # Validate the --validation flag value
     valid_modes = ("strict", "normal", "lenient")
     if validation not in valid_modes:
-        console.print(
-            f"[red]Invalid --validation value:[/red] '{validation}'. "
-            f"Choose from: {', '.join(valid_modes)}"
-        )
+        console.print(f"[red]Invalid --validation value:[/red] '{validation}'. Choose from: {', '.join(valid_modes)}")
         raise typer.Exit(code=1)
 
     result = run_pipeline(
@@ -154,7 +150,9 @@ def apply(
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
-    mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
+    mark_failed: Optional[str] = typer.Option(
+        None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."
+    ),
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
 ) -> None:
@@ -168,18 +166,21 @@ def apply(
 
     if mark_applied:
         from applypilot.apply.launcher import mark_job
+
         mark_job(mark_applied, "applied")
         console.print(f"[green]Marked as applied:[/green] {mark_applied}")
         return
 
     if mark_failed:
         from applypilot.apply.launcher import mark_job
+
         mark_job(mark_failed, "failed", reason=fail_reason)
         console.print(f"[yellow]Marked as failed:[/yellow] {mark_failed} ({fail_reason or 'manual'})")
         return
 
     if reset_failed:
         from applypilot.apply.launcher import reset_failed as do_reset
+
         count = do_reset()
         console.print(f"[green]Reset {count} failed job(s) for retry.[/green]")
         return
@@ -191,27 +192,25 @@ def apply(
 
     # Check 2: Profile exists
     if not _profile_path.exists():
-        console.print(
-            "[red]Profile not found.[/red]\n"
-            "Run [bold]applypilot init[/bold] to create your profile first."
-        )
+        console.print("[red]Profile not found.[/red]\nRun [bold]applypilot init[/bold] to create your profile first.")
         raise typer.Exit(code=1)
 
     # Check 3: Tailored resumes exist (skip for --gen with --url)
     if not (gen and url):
         conn = get_connection()
-        ready = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
-        ).fetchone()[0]
+        from applypilot.readiness import count_ready_to_apply
+
+        ready = count_ready_to_apply(conn, min_score=min_score)
         if ready == 0:
             console.print(
-                "[red]No tailored resumes ready.[/red]\n"
-                "Run [bold]applypilot run score tailor[/bold] first to prepare applications."
+                "[red]No strictly ready applications.[/red]\n"
+                "Run [bold]applypilot audit[/bold] to see what is blocked, then regenerate as needed."
             )
             raise typer.Exit(code=1)
 
     if gen:
-        from applypilot.apply.launcher import gen_prompt, BASE_CDP_PORT
+        from applypilot.apply.launcher import gen_prompt
+
         target = url or ""
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
@@ -222,11 +221,9 @@ def apply(
             raise typer.Exit(code=1)
         mcp_path = _profile_path.parent / ".mcp-apply-0.json"
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        console.print(f"\n[bold]Run manually:[/bold]")
+        console.print("\n[bold]Run manually:[/bold]")
         console.print(
-            f"  claude --model {model} -p "
-            f"--mcp-config {mcp_path} "
-            f"--permission-mode bypassPermissions < {prompt_file}"
+            f"  claude --model {model} -p --mcp-config {mcp_path} --permission-mode bypassPermissions < {prompt_file}"
         )
         return
 
@@ -276,6 +273,7 @@ def status() -> None:
     summary.add_row("With full description", str(stats["with_description"]))
     summary.add_row("Pending enrichment", str(stats["pending_detail"]))
     summary.add_row("Enrichment errors", str(stats["detail_errors"]))
+    summary.add_row("Manual review", str(stats["manual_review"]))
     summary.add_row("Scored by LLM", str(stats["scored"]))
     summary.add_row("Pending scoring", str(stats["unscored"]))
     summary.add_row("Tailored resumes", str(stats["tailored"]))
@@ -323,6 +321,75 @@ def status() -> None:
 
 
 @app.command()
+def audit(
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable readiness audit output."),
+    fix: bool = typer.Option(False, "--fix", help="Clear unsafe artifact paths and mark unsafe rows manual_review."),
+    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for readiness checks."),
+) -> None:
+    """Audit strict apply-readiness invariants."""
+    _bootstrap()
+
+    from applypilot.database import get_connection
+    from applypilot.readiness import audit_jobs, backup_database, fix_not_ready_jobs
+
+    conn = get_connection()
+    audited = audit_jobs(conn, min_score=min_score)
+    blocked = [item for item in audited if not item["readiness"]["ready"]]
+    ready = len(audited) - len(blocked)
+
+    if json_output:
+        payload = {
+            "ready": ready,
+            "blocked": len(blocked),
+            "jobs": [
+                {
+                    "url": item["url"],
+                    "title": item.get("title"),
+                    "site": item.get("site"),
+                    "location": item.get("location"),
+                    "fit_score": item.get("fit_score"),
+                    "readiness": item["readiness"],
+                }
+                for item in audited
+            ],
+        }
+        console.print(json.dumps(payload, indent=2))
+    else:
+        table = Table(title="Readiness Audit", show_header=True, header_style="bold cyan")
+        table.add_column("Status", style="bold")
+        table.add_column("Score", justify="right")
+        table.add_column("Site")
+        table.add_column("Title")
+        table.add_column("Location")
+        table.add_column("Reasons")
+
+        for item in audited:
+            readiness = item["readiness"]
+            status = "[green]ready[/green]" if readiness["ready"] else "[red]blocked[/red]"
+            table.add_row(
+                status,
+                str(item.get("fit_score") or ""),
+                str(item.get("site") or ""),
+                str(item.get("title") or "")[:45],
+                str(item.get("location") or "")[:35],
+                ", ".join(readiness["reasons"])[:90],
+            )
+        console.print(table)
+        console.print(f"\nReady: [green]{ready}[/green] | Blocked: [red]{len(blocked)}[/red]")
+
+    if fix:
+        backup = backup_database(conn)
+        counts = fix_not_ready_jobs(conn, audited)
+        console.print(f"\n[yellow]Backup written:[/yellow] {backup}")
+        console.print(
+            "[green]Fix complete:[/green] "
+            f"{counts['manual_review']} marked manual_review, "
+            f"{counts['cleared_tailor']} tailored paths cleared, "
+            f"{counts['cleared_cover']} cover paths cleared."
+        )
+
+
+@app.command()
 def dashboard() -> None:
     """Generate and open the HTML dashboard in your browser."""
     _bootstrap()
@@ -337,8 +404,12 @@ def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
     import shutil
     from applypilot.config import (
-        load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
-        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path,
+        load_env,
+        PROFILE_PATH,
+        RESUME_PATH,
+        RESUME_PDF_PATH,
+        SEARCH_CONFIG_PATH,
+        get_chrome_path,
     )
 
     load_env()
@@ -373,13 +444,20 @@ def doctor() -> None:
     # jobspy (discovery dep installed separately)
     try:
         import jobspy  # noqa: F401
+
         results.append(("python-jobspy", ok_mark, "Job board scraping available"))
     except ImportError:
-        results.append(("python-jobspy", warn_mark,
-                        "pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex"))
+        results.append(
+            (
+                "python-jobspy",
+                warn_mark,
+                "pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex",
+            )
+        )
 
     # --- Tier 2 checks ---
     import os
+
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
@@ -392,8 +470,7 @@ def doctor() -> None:
     elif has_local:
         results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
     else:
-        results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+        results.append(("LLM API key", fail_mark, "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
 
     # --- Tier 3 checks ---
     # Claude Code CLI
@@ -401,32 +478,32 @@ def doctor() -> None:
     if claude_bin:
         results.append(("Claude Code CLI", ok_mark, claude_bin))
     else:
-        results.append(("Claude Code CLI", fail_mark,
-                        "Install from https://claude.ai/code (needed for auto-apply)"))
+        results.append(("Claude Code CLI", fail_mark, "Install from https://claude.ai/code (needed for auto-apply)"))
 
     # Chrome
     try:
         chrome_path = get_chrome_path()
         results.append(("Chrome/Chromium", ok_mark, chrome_path))
     except FileNotFoundError:
-        results.append(("Chrome/Chromium", fail_mark,
-                        "Install Chrome or set CHROME_PATH env var (needed for auto-apply)"))
+        results.append(
+            ("Chrome/Chromium", fail_mark, "Install Chrome or set CHROME_PATH env var (needed for auto-apply)")
+        )
 
     # Node.js / npx (for Playwright MCP)
     npx_bin = shutil.which("npx")
     if npx_bin:
         results.append(("Node.js (npx)", ok_mark, npx_bin))
     else:
-        results.append(("Node.js (npx)", fail_mark,
-                        "Install Node.js 18+ from nodejs.org (needed for auto-apply)"))
+        results.append(("Node.js (npx)", fail_mark, "Install Node.js 18+ from nodejs.org (needed for auto-apply)"))
 
     # CapSolver (optional)
     capsolver = os.environ.get("CAPSOLVER_API_KEY")
     if capsolver:
         results.append(("CapSolver API key", ok_mark, "CAPTCHA solving enabled"))
     else:
-        results.append(("CapSolver API key", "[dim]optional[/dim]",
-                        "Set CAPSOLVER_API_KEY in .env for CAPTCHA solving"))
+        results.append(
+            ("CapSolver API key", "[dim]optional[/dim]", "Set CAPSOLVER_API_KEY in .env for CAPTCHA solving")
+        )
 
     # --- Render results ---
     console.print()
@@ -441,6 +518,7 @@ def doctor() -> None:
 
     # Tier summary
     from applypilot.config import get_tier, TIER_LABELS
+
     tier = get_tier()
     console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
 
