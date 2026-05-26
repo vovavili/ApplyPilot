@@ -9,30 +9,72 @@ is always code-injected, never LLM-generated. Each retry starts a fresh conversa
 to avoid apologetic spirals.
 """
 
+import copy
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
-from pathlib import Path
+from hashlib import sha1
 
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
-from applypilot.llm import get_client
+from applypilot.events import emit_error, emit_event
+from applypilot.humanizer import get_humanizer_prompt
+from applypilot.llm import get_client, make_anthropic_client, make_client
 from applypilot.scoring.validator import (
     BANNED_WORDS,
-    FABRICATION_WATCHLIST,
     sanitize_text,
     validate_json_fields,
-    validate_tailored_resume,
 )
 
 log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 5  # max cross-run retries before giving up
+RESUME_SECTION_HEADERS = {
+    "SUMMARY",
+    "TECHNICAL SKILLS",
+    "SKILLS",
+    "EXPERIENCE",
+    "PROJECTS",
+    "EDUCATION",
+}
+
+
+def _tailor_model_override() -> str:
+    return os.environ.get("TAILOR_LLM_MODEL", "").strip()
+
+
+def _tailor_provider_override() -> str:
+    return os.environ.get("TAILOR_LLM_PROVIDER", "").strip().casefold()
+
+
+def _is_claude_model(model: str) -> bool:
+    normalized = model.strip().casefold()
+    return normalized.startswith(("claude-", "anthropic/claude-"))
+
+
+def _get_tailor_client():
+    provider = _tailor_provider_override()
+    model = _tailor_model_override()
+    if provider in {"anthropic", "claude"} or (model and _is_claude_model(model)):
+        return make_anthropic_client(model=model or None)
+    if model:
+        return make_client(model=model)
+    return get_client()
+
+
+def _job_file_prefix(job: dict) -> str:
+    """Build a stable, collision-resistant filename prefix for a job."""
+    safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
+    safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
+    digest = sha1(str(job["url"]).encode("utf-8")).hexdigest()[:8]
+    return f"{safe_site}_{safe_title}_{digest}"
 
 
 # ── Prompt Builders (profile-driven) ──────────────────────────────────────
+
 
 def _build_tailor_prompt(profile: dict) -> str:
     """Build the resume tailoring system prompt from the user's profile.
@@ -55,11 +97,19 @@ def _build_tailor_prompt(profile: dict) -> str:
     companies = resume_facts.get("preserved_companies", [])
     projects = resume_facts.get("preserved_projects", [])
     school = resume_facts.get("preserved_school", "")
+    education_block = _education_block_from_profile(profile)
     real_metrics = resume_facts.get("real_metrics", [])
+    employment_types = resume_facts.get("employment_type_by_company", {})
+    employment_context = resume_facts.get("employment_context", "")
 
     companies_str = ", ".join(companies) if companies else "N/A"
     projects_str = ", ".join(projects) if projects else "N/A"
     metrics_str = ", ".join(real_metrics) if real_metrics else "N/A"
+    employment_lines = (
+        "\n".join(f"- {company}: {employment_type}" for company, employment_type in employment_types.items())
+        if isinstance(employment_types, dict) and employment_types
+        else "N/A"
+    )
 
     # Include ALL banned words from the validator so the LLM knows exactly
     # what will be rejected — the validator checks for these automatically.
@@ -68,7 +118,7 @@ def _build_tailor_prompt(profile: dict) -> str:
     education = profile.get("experience", {})
     education_level = education.get("education_level", "")
 
-    return f"""You are a senior technical recruiter rewriting a resume to get this person an interview.
+    prompt = f"""You are a senior technical recruiter rewriting a resume to get this person an interview.
 
 Take the base resume and job description. Return a tailored resume as a JSON object.
 
@@ -93,9 +143,23 @@ SKILLS: Reorder each category so the job's must-haves appear first.
 
 Reframe EVERY bullet for this role. Same real work, different angle. Every bullet must be reworded. Never copy verbatim.
 
-PROJECTS: Reorder by relevance. Drop irrelevant projects entirely.
+PROJECTS: Reorder by relevance. If no project is relevant, return "projects": [].
 
 BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, Designed, Implemented, Reduced, Automated, Deployed, Operated, Optimized). Most relevant first. Max 4 per section.
+
+EXPERIENCE TIMELINE: Include every company listed under Preserved companies exactly once. Never omit older roles to save space. If space is tight, keep older roles to 1-2 bullets, but keep the company, role, employment type, and dates visible.
+
+EMPLOYMENT TYPE IS A FACT:
+{employment_lines}
+
+{employment_context}
+
+For every experience entry, preserve the employment type in the role text. Use headers like "Senior Data Engineer, contractor at KPMG" or "Data Engineer, full-time at Metyis/Adaptfy". Do not drop "contractor" to save space; it explains fixed-term roles and short tenures.
+
+EDUCATION IS A FACT:
+{education_block or f"{school} | {education_level}"}
+
+Preserve education school names, degree labels, campus locations, and date ranges. Do not collapse three schools into one line. Do not replace dated education with only "{education_level}".
 
 ## VOICE:
 - Write like a real engineer. Short, direct.
@@ -109,12 +173,77 @@ BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, De
 - Do NOT invent work, companies, degrees, or certifications
 - Do NOT change real numbers ({metrics_str})
 - Preserved companies: {companies_str} -- names stay as-is
+- Do NOT remove or combine preserved companies. The timeline matters.
+- Preserved employment types:
+{employment_lines}
 - Preserved school: {school}
+- Preserved education block:
+{education_block or f"{school} | {education_level}"}
 - Must fit 1 page.
+"""
 
+    education_json = json.dumps(education_block or f"{school} | {education_level}", ensure_ascii=False)
+    output_contract = f"""
 ## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
 
-{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{school} | {education_level}"}}"""
+{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[],"education":{education_json}}}"""
+    return prompt + get_humanizer_prompt("resume") + output_contract
+
+
+def _profile_with_preserved_education(profile: dict, resume_text: str) -> dict:
+    """Attach an exact education block so tailoring cannot compress it away."""
+    patched = copy.deepcopy(profile)
+    facts = patched.setdefault("resume_facts", {})
+    if _education_block_from_profile(patched):
+        return patched
+
+    extracted = _extract_resume_section(resume_text, "EDUCATION")
+    if extracted:
+        facts["education_block"] = extracted
+    return patched
+
+
+def _education_block_from_profile(profile: dict) -> str:
+    education = profile.get("education")
+    if isinstance(education, list) and education:
+        lines: list[str] = []
+        for entry in education:
+            if not isinstance(entry, dict):
+                continue
+            school = str(entry.get("school") or "").strip()
+            location = str(entry.get("location") or "").strip()
+            degree = str(entry.get("degree") or "").strip()
+            dates = str(entry.get("dates") or "").strip()
+            first_line = " ".join(part for part in (school, location) if part).strip()
+            second_line = " ".join(part for part in (degree, dates) if part).strip()
+            if first_line:
+                lines.append(first_line)
+            if second_line:
+                lines.append(second_line)
+        return "\n".join(lines).strip()
+
+    facts = profile.get("resume_facts", {})
+    block = facts.get("education_block") if isinstance(facts, dict) else ""
+    return sanitize_text(str(block or "")).strip()
+
+
+def _extract_resume_section(text: str, section_name: str) -> str:
+    lines = text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip().casefold() == section_name.casefold():
+            start = index + 1
+            break
+    if start is None:
+        return ""
+
+    section_lines: list[str] = []
+    for line in lines[start:]:
+        stripped = line.strip()
+        if stripped.upper() in RESUME_SECTION_HEADERS:
+            break
+        section_lines.append(line.rstrip())
+    return sanitize_text("\n".join(section_lines).strip())
 
 
 def _build_judge_prompt(profile: dict) -> str:
@@ -131,6 +260,12 @@ def _build_judge_prompt(profile: dict) -> str:
 
     real_metrics = resume_facts.get("real_metrics", [])
     metrics_str = ", ".join(real_metrics) if real_metrics else "N/A"
+    employment_types = resume_facts.get("employment_type_by_company", {})
+    employment_lines = (
+        "\n".join(f"- {company}: {employment_type}" for company, employment_type in employment_types.items())
+        if isinstance(employment_types, dict) and employment_types
+        else "N/A"
+    )
 
     return f"""You are a resume quality judge. A tailoring engine rewrote a resume to target a specific job. Your job is to catch LIES, not style changes.
 
@@ -153,6 +288,8 @@ ISSUES: (list any problems, or "none")
 3. Inventing work that has no basis in any original bullet (completely new achievements).
 4. Adding companies, roles, or degrees that don't exist.
 5. Changing real numbers (inflating 80% to 95%, 500 nodes to 1000 nodes).
+6. Removing or contradicting employment type labels for these roles:
+{employment_lines}
 
 ## WHAT IS NOT FABRICATION (do NOT fail for these):
 - Rewording any bullet, even heavily, as long as the underlying work is real
@@ -174,6 +311,7 @@ Be strict about major lies. Be lenient about minor stretches and learnable skill
 
 
 # ── JSON Extraction ───────────────────────────────────────────────────────
+
 
 def extract_json(raw: str) -> dict:
     """Robustly extract JSON from LLM response (handles fences, preamble).
@@ -211,7 +349,7 @@ def extract_json(raw: str) -> dict:
     end = raw.rfind("}")
     if start != -1 and end > start:
         try:
-            return json.loads(raw[start:end + 1])
+            return json.loads(raw[start : end + 1])
         except json.JSONDecodeError:
             pass
 
@@ -219,6 +357,7 @@ def extract_json(raw: str) -> dict:
 
 
 # ── Resume Assembly (profile-driven header) ──────────────────────────────
+
 
 def assemble_resume_text(data: dict, profile: dict) -> str:
     """Convert JSON resume data to formatted plain text.
@@ -240,9 +379,16 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
     lines.append(personal.get("full_name", ""))
     lines.append(sanitize_text(data.get("title", "Software Engineer")))
 
-    # Location from search config or profile -- leave blank if not available
-    # The location line is optional; the original used a hardcoded city.
-    # We omit it here; the LLM prompt can include it if the user sets it.
+    location = ", ".join(
+        part
+        for part in (
+            personal.get("city", ""),
+            personal.get("country", ""),
+        )
+        if part
+    )
+    if location:
+        lines.append(location)
 
     # Contact line
     contact_parts: list[str] = []
@@ -292,16 +438,17 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
 
     # Education
     lines.append("EDUCATION")
-    lines.append(sanitize_text(str(data.get("education", ""))))
+    education = _education_block_from_profile(profile) or sanitize_text(str(data.get("education", "")))
+    if education:
+        lines.append(education)
 
     return "\n".join(lines)
 
 
 # ── LLM Judge ────────────────────────────────────────────────────────────
 
-def judge_tailored_resume(
-    original_text: str, tailored_text: str, job_title: str, profile: dict
-) -> dict:
+
+def judge_tailored_resume(original_text: str, tailored_text: str, job_title: str, profile: dict) -> dict:
     """LLM judge layer: catches subtle fabrication that programmatic checks miss.
 
     Args:
@@ -317,12 +464,15 @@ def judge_tailored_resume(
 
     messages = [
         {"role": "system", "content": judge_prompt},
-        {"role": "user", "content": (
-            f"JOB TITLE: {job_title}\n\n"
-            f"ORIGINAL RESUME:\n{original_text}\n\n---\n\n"
-            f"TAILORED RESUME:\n{tailored_text}\n\n"
-            "Judge this tailored resume:"
-        )},
+        {
+            "role": "user",
+            "content": (
+                f"JOB TITLE: {job_title}\n\n"
+                f"ORIGINAL RESUME:\n{original_text}\n\n---\n\n"
+                f"TAILORED RESUME:\n{tailored_text}\n\n"
+                "Judge this tailored resume:"
+            ),
+        },
     ]
 
     client = get_client()
@@ -332,7 +482,7 @@ def judge_tailored_resume(
     issues = "none"
     if "ISSUES:" in response.upper():
         issues_idx = response.upper().index("ISSUES:")
-        issues = response[issues_idx + 7:].strip()
+        issues = response[issues_idx + 7 :].strip()
 
     return {
         "passed": passed,
@@ -344,9 +494,13 @@ def judge_tailored_resume(
 
 # ── Core Tailoring ───────────────────────────────────────────────────────
 
+
 def tailor_resume(
-    resume_text: str, job: dict, profile: dict,
-    max_retries: int = 3, validation_mode: str = "normal",
+    resume_text: str,
+    job: dict,
+    profile: dict,
+    max_retries: int = 3,
+    validation_mode: str = "normal",
 ) -> tuple[str, dict]:
     """Generate a tailored resume via JSON output + fresh context on each retry.
 
@@ -375,14 +529,23 @@ def tailor_resume(
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
         f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
     )
+    profile = _profile_with_preserved_education(profile, resume_text)
 
     report: dict = {
-        "attempts": 0, "validator": None, "judge": None,
-        "status": "pending", "validation_mode": validation_mode,
+        "attempts": 0,
+        "validator": None,
+        "judge": None,
+        "status": "pending",
+        "validation_mode": validation_mode,
+        "parse_errors": [],
+        "tailor_model_override": bool(_tailor_model_override()),
+        "tailor_provider_override": _tailor_provider_override() or None,
+        "model": None,
     }
     avoid_notes: list[str] = []
     tailored = ""
-    client = get_client()
+    client = _get_tailor_client()
+    report["model"] = getattr(client, "model", None)
     tailor_prompt_base = _build_tailor_prompt(profile)
 
     for attempt in range(max_retries + 1):
@@ -397,15 +560,25 @@ def tailor_resume(
 
         messages = [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:"},
+            {
+                "role": "user",
+                "content": f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:",
+            },
         ]
 
-        raw = client.chat(messages, max_tokens=2048, temperature=0.4)
+        raw = client.chat(messages, max_tokens=8192, temperature=0.4)
 
         # Parse JSON from response
         try:
             data = extract_json(raw)
-        except ValueError:
+        except ValueError as e:
+            report["parse_errors"].append(
+                {
+                    "attempt": attempt + 1,
+                    "error": str(e),
+                    "raw_excerpt": raw[:500],
+                }
+            )
             avoid_notes.append("Output was not valid JSON. Return ONLY a JSON object, nothing else.")
             continue
 
@@ -449,14 +622,14 @@ def tailor_resume(
         report["status"] = "approved"
         return tailored, report
 
-    report["status"] = "exhausted_retries"
+    report["status"] = "invalid_json" if report["parse_errors"] and not tailored else "exhausted_retries"
     return tailored, report
 
 
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
-def run_tailoring(min_score: int = 7, limit: int = 20,
-                  validation_mode: str = "normal") -> dict:
+
+def run_tailoring(min_score: int = 7, limit: int = 20, validation_mode: str = "normal") -> dict:
     """Generate tailored resumes for high-scoring jobs.
 
     Args:
@@ -487,17 +660,16 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     for job in jobs:
         completed += 1
         try:
-            tailored, report = tailor_resume(resume_text, job, profile,
-                                             validation_mode=validation_mode)
+            tailored, report = tailor_resume(resume_text, job, profile, validation_mode=validation_mode)
 
-            # Build safe filename prefix
-            safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
-            safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            prefix = f"{safe_site}_{safe_title}"
+            prefix = _job_file_prefix(job)
 
-            # Save tailored resume text
+            # Save tailored resume text only when the LLM produced one.
             txt_path = TAILORED_DIR / f"{prefix}.txt"
-            txt_path.write_text(tailored, encoding="utf-8")
+            if tailored.strip():
+                txt_path.write_text(tailored, encoding="utf-8")
+            else:
+                txt_path = None
 
             # Save job description for traceability
             job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
@@ -518,28 +690,65 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             # Generate PDF for approved resumes (best-effort)
             # "approved_with_judge_warning" is also a success — resume was generated.
             pdf_path = None
-            if report["status"] in ("approved", "approved_with_judge_warning"):
+            if txt_path and report["status"] in ("approved", "approved_with_judge_warning"):
                 try:
                     from applypilot.scoring.pdf import convert_to_pdf
+
                     pdf_path = str(convert_to_pdf(txt_path))
                 except Exception:
                     log.debug("PDF generation failed for %s", txt_path, exc_info=True)
 
             result = {
                 "url": job["url"],
-                "path": str(txt_path),
+                "path": str(txt_path) if txt_path else None,
                 "pdf_path": pdf_path,
+                "report_path": str(report_path),
                 "title": job["title"],
                 "site": job["site"],
                 "status": report["status"],
                 "attempts": report["attempts"],
             }
+            event_fields = {
+                "job_url": job["url"],
+                "job_title": job["title"],
+                "site": job["site"],
+                "attempts": report["attempts"],
+                "report_path": report_path,
+                "resume_path": txt_path,
+                "pdf_path": pdf_path,
+                "parse_error_count": len(report.get("parse_errors") or []),
+            }
+            if report.get("parse_errors"):
+                event_fields["first_parse_error"] = report["parse_errors"][0]
+            if report["status"] in ("approved", "approved_with_judge_warning"):
+                emit_event("tailor_job_finished", stage="tailor", status=report["status"], **event_fields)
+            else:
+                emit_event(
+                    "tailor_job_failed",
+                    level="error",
+                    stage="tailor",
+                    status=report["status"],
+                    **event_fields,
+                )
         except Exception as e:
             result = {
-                "url": job["url"], "title": job["title"], "site": job["site"],
-                "status": "error", "attempts": 0, "path": None, "pdf_path": None,
+                "url": job["url"],
+                "title": job["title"],
+                "site": job["site"],
+                "status": "error",
+                "attempts": 0,
+                "path": None,
+                "pdf_path": None,
             }
             log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
+            emit_error(
+                "tailor_job_exception",
+                e,
+                stage="tailor",
+                job_url=job["url"],
+                job_title=job["title"],
+                site=job["site"],
+            )
 
         results.append(result)
         stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
@@ -548,7 +757,8 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         rate = completed / elapsed if elapsed > 0 else 0
         log.info(
             "%d/%d [%s] attempts=%s | %.1f jobs/min | %s",
-            completed, len(jobs),
+            completed,
+            len(jobs),
             result["status"].upper(),
             result.get("attempts", "?"),
             rate * 60,
@@ -573,18 +783,20 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     conn.commit()
 
     elapsed = time.time() - t0
+    failed_count = sum(
+        count for status, count in stats.items() if status not in {"approved", "approved_with_judge_warning", "error"}
+    )
     log.info(
-        "Tailoring done in %.1fs: %d approved, %d failed_validation, %d failed_judge, %d errors",
+        "Tailoring done in %.1fs: %d approved, %d failed, %d errors",
         elapsed,
         stats.get("approved", 0),
-        stats.get("failed_validation", 0),
-        stats.get("failed_judge", 0),
+        failed_count,
         stats.get("error", 0),
     )
 
     return {
         "approved": stats.get("approved", 0),
-        "failed": stats.get("failed_validation", 0) + stats.get("failed_judge", 0),
+        "failed": failed_count,
         "errors": stats.get("error", 0),
         "elapsed": elapsed,
     }

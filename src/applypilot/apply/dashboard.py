@@ -7,7 +7,7 @@ in a terminal dashboard using the Rich library.
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -48,6 +48,7 @@ MAX_EVENTS = 8
 # ---------------------------------------------------------------------------
 # State mutation helpers
 # ---------------------------------------------------------------------------
+
 
 def init_worker(worker_id: int = 0) -> None:
     """Register the worker in the dashboard state."""
@@ -158,8 +159,15 @@ def render_dashboard() -> Table:
     # Totals row
     table.add_section()
     table.add_row(
-        "", "", "", "", "", "TOTAL",
-        str(total_applied), str(total_failed), f"${total_cost:.3f}",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "TOTAL",
+        str(total_applied),
+        str(total_failed),
+        f"${total_cost:.3f}",
         style="bold",
     )
 

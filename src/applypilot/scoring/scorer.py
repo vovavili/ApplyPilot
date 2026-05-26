@@ -5,15 +5,16 @@ job description. All personal data is loaded at runtime from the user's
 profile and resume file.
 """
 
-import json
 import logging
 import re
 import time
 from datetime import datetime, timezone
 
-from applypilot.config import RESUME_PATH, load_profile
-from applypilot.database import get_connection, get_jobs_by_stage
+from applypilot.config import RESUME_PATH
+from applypilot.database import get_connection
+from applypilot.events import emit_error, emit_event
 from applypilot.llm import get_client
+from applypilot.scoring.selection import score_selection_sql
 
 log = logging.getLogger(__name__)
 
@@ -98,6 +99,14 @@ def score_job(resume_text: str, job: dict) -> dict:
         return _parse_score_response(response)
     except Exception as e:
         log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
+        emit_error(
+            "score_job_exception",
+            e,
+            stage="score",
+            job_url=job.get("url"),
+            job_title=job.get("title"),
+            site=job.get("site"),
+        )
         return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
 
 
@@ -113,14 +122,7 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     """
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
-
-    if rescore:
-        query = "SELECT * FROM jobs WHERE full_description IS NOT NULL"
-        if limit > 0:
-            query += f" LIMIT {limit}"
-        jobs = conn.execute(query).fetchall()
-    else:
-        jobs = get_jobs_by_stage(conn=conn, stage="pending_score", limit=limit)
+    jobs = _load_jobs_to_score(conn, limit=limit, rescore=rescore)
 
     if not jobs:
         log.info("No unscored jobs with descriptions found.")
@@ -135,34 +137,55 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     t0 = time.time()
     completed = 0
     errors = 0
-    results: list[dict] = []
 
     for job in jobs:
         result = score_job(resume_text, job)
-        result["url"] = job["url"]
         completed += 1
 
         if result["score"] == 0:
             errors += 1
+            emit_event(
+                "score_job_failed",
+                level="error",
+                stage="score",
+                status="score_zero",
+                job_url=job["url"],
+                job_title=job.get("title"),
+                site=job.get("site"),
+                reasoning=result.get("reasoning", ""),
+            )
+        else:
+            emit_event(
+                "score_job_finished",
+                stage="score",
+                status="ok",
+                job_url=job["url"],
+                job_title=job.get("title"),
+                site=job.get("site"),
+                score=result["score"],
+            )
 
-        results.append(result)
+        conn.execute(
+            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+            (
+                result["score"],
+                f"{result['keywords']}\n{result['reasoning']}",
+                datetime.now(timezone.utc).isoformat(),
+                job["url"],
+            ),
+        )
+        conn.commit()
 
         log.info(
             "[%d/%d] score=%d  %s",
-            completed, len(jobs), result["score"], job.get("title", "?")[:60],
+            completed,
+            len(jobs),
+            result["score"],
+            job.get("title", "?")[:60],
         )
-
-    # Write scores to DB
-    now = datetime.now(timezone.utc).isoformat()
-    for r in results:
-        conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
-        )
-    conn.commit()
 
     elapsed = time.time() - t0
-    log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)
+    log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", completed, elapsed, completed / elapsed if elapsed > 0 else 0)
 
     # Score distribution
     dist = conn.execute("""
@@ -173,8 +196,17 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     distribution = [(row[0], row[1]) for row in dist]
 
     return {
-        "scored": len(results),
+        "scored": completed,
         "errors": errors,
         "elapsed": elapsed,
         "distribution": distribution,
     }
+
+
+def _load_jobs_to_score(conn, limit: int = 0, rescore: bool = False) -> list:
+    where, params = score_selection_sql(rescore=rescore)
+    query = f"SELECT * FROM jobs WHERE {' AND '.join(where)} ORDER BY fit_score DESC NULLS LAST, discovered_at DESC"
+    if limit > 0:
+        query += " LIMIT ?"
+        params.append(limit)
+    return conn.execute(query, params).fetchall()

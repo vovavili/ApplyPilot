@@ -14,6 +14,7 @@ import sqlite3
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 
@@ -22,23 +23,110 @@ import yaml
 from applypilot import config
 from applypilot.config import CONFIG_DIR
 from applypilot.database import get_connection, init_db
+from applypilot.events import emit_error, emit_event
 
 log = logging.getLogger(__name__)
+
+REVIEW_STATUS_MANUAL = "manual_review"
+
+REMOTE_TERMS = (
+    "remote",
+    "virtual",
+    "work from home",
+    "wfh",
+    "distributed",
+    "anywhere",
+    "home based",
+    "home-based",
+)
+EUROPE_TERMS = (
+    "europe",
+    "european union",
+    "emea",
+)
+SHORT_EU_TERMS = ("eu",)
+NL_TERMS = (
+    "netherlands",
+    "nederland",
+    "amsterdam",
+    "rotterdam",
+    "utrecht",
+    "the hague",
+    "den haag",
+    "delft",
+    "leiden",
+    "eindhoven",
+    "north holland",
+    "south holland",
+    "noord-holland",
+    "zuid-holland",
+)
+VAGUE_LOCATION_TERMS = (
+    "multiple locations",
+    "various locations",
+    "multiple",
+    "global",
+    "worldwide",
+    "flexible",
+    "hybrid",
+)
+WORKDAY_REQUIRED_EMPLOYER_FIELDS = ("name", "tenant", "site_id", "base_url")
+
+
+@dataclass(frozen=True)
+class LocationTriage:
+    decision: str
+    reason: str
 
 
 # -- Employer registry from YAML --------------------------------------------
 
+
 def load_employers() -> dict:
-    """Load Workday employer registry from config/employers.yaml."""
-    path = CONFIG_DIR / "employers.yaml"
+    """Load packaged and user Workday employer registries."""
+    packaged = _load_employer_file(CONFIG_DIR / "employers.yaml", source="packaged")
+    user = _load_employer_file(config.APP_DIR / "workday_employers.yaml", source="user")
+    return {**packaged, **user}
+
+
+def _load_employer_file(path, source: str) -> dict:
+    """Load and validate a Workday employer YAML file."""
     if not path.exists():
-        log.warning("employers.yaml not found at %s", path)
+        if source == "packaged":
+            log.warning("employers.yaml not found at %s", path)
         return {}
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    return data.get("employers", {})
+
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    employers = data.get("employers", {})
+    if not isinstance(employers, dict):
+        log.warning("Workday employer registry %s has no valid 'employers' mapping: %s", source, path)
+        return {}
+    return _validate_employers(employers, source=source)
+
+
+def _validate_employers(employers: dict, source: str = "configured") -> dict:
+    """Drop malformed employer entries and keep valid Workday definitions."""
+    valid = {}
+    for key, employer in employers.items():
+        if not isinstance(employer, dict):
+            log.warning("Skipping malformed Workday employer %s from %s: expected mapping", key, source)
+            continue
+
+        missing = [field for field in WORKDAY_REQUIRED_EMPLOYER_FIELDS if not employer.get(field)]
+        if missing:
+            log.warning(
+                "Skipping malformed Workday employer %s from %s: missing %s",
+                key,
+                source,
+                ", ".join(missing),
+            )
+            continue
+        valid[str(key)] = employer
+    return valid
 
 
 # -- Location filtering from search config -----------------------------------
+
 
 def _load_location_filter(search_cfg: dict | None = None):
     """Load location accept/reject lists from search config."""
@@ -51,27 +139,78 @@ def _load_location_filter(search_cfg: dict | None = None):
 
 
 def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
-    """Check if a job location passes the user's location filter."""
-    if not location:
-        return True
+    """Backward-compatible boolean wrapper around Workday location triage."""
+    return _triage_location(location, accept, reject).decision == "accept"
 
-    loc = location.lower()
 
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
+def _triage_location(
+    location: str | None,
+    accept: list[str],
+    reject: list[str],
+    *,
+    policy: str = "recall_first",
+) -> LocationTriage:
+    """Classify a Workday location as accepted, manual-review, or rejected."""
+    text = str(location or "").strip()
+    if not text:
+        return _ambiguous_location(policy, "blank_location")
 
-    for r in reject:
-        if r.lower() in loc:
-            return False
+    loc = text.casefold()
 
-    for a in accept:
-        if a.lower() in loc:
+    if _contains_any(loc, NL_TERMS):
+        return LocationTriage("accept", "accepted_nl_or_configured")
+
+    if _contains_any(loc, EUROPE_TERMS) or _contains_short_term(loc, SHORT_EU_TERMS):
+        return LocationTriage("accept", "accepted_europe_emea")
+
+    if _contains_any(loc, REMOTE_TERMS):
+        if _contains_any(loc, reject):
+            return LocationTriage("reject", "rejected_remote_restricted_foreign")
+        return LocationTriage("accept", "accepted_remote")
+
+    if _contains_accept_term(loc, accept):
+        return LocationTriage("accept", "accepted_nl_or_configured")
+
+    if _contains_any(loc, VAGUE_LOCATION_TERMS):
+        return _ambiguous_location(policy, "ambiguous_location")
+
+    if _contains_any(loc, reject):
+        return LocationTriage("reject", "rejected_non_remote_foreign")
+
+    return _ambiguous_location(policy, "unmatched_location")
+
+
+def _ambiguous_location(policy: str, reason: str) -> LocationTriage:
+    if policy == "strict":
+        return LocationTriage("reject", reason)
+    if policy == "balanced" and reason != "ambiguous_location":
+        return LocationTriage("reject", reason)
+    return LocationTriage("manual_review", reason)
+
+
+def _contains_any(text: str, terms: list[str] | tuple[str, ...]) -> bool:
+    return any(str(term).strip().casefold() in text for term in terms if str(term).strip())
+
+
+def _contains_accept_term(text: str, terms: list[str]) -> bool:
+    for term in terms:
+        value = str(term).strip().casefold()
+        if not value:
+            continue
+        if len(value) <= 3:
+            if re.search(rf"\b{re.escape(value)}\b", text):
+                return True
+        elif value in text:
             return True
-
     return False
 
 
+def _contains_short_term(text: str, terms: tuple[str, ...]) -> bool:
+    return any(re.search(rf"\b{re.escape(term)}\b", text) for term in terms)
+
+
 # -- HTML stripper -----------------------------------------------------------
+
 
 class _HTMLStripper(HTMLParser):
     """Strip HTML tags, keep text content."""
@@ -136,10 +275,12 @@ def setup_proxy(proxy_str: str | None) -> None:
         _opener = urllib.request.build_opener()
         return
 
-    proxy_handler = urllib.request.ProxyHandler({
-        "http": proxy_url,
-        "https": proxy_url,
-    })
+    proxy_handler = urllib.request.ProxyHandler(
+        {
+            "http": proxy_url,
+            "https": proxy_url,
+        }
+    )
     _opener = urllib.request.build_opener(proxy_handler)
     log.info("Proxy configured: %s:%s", parts[0], parts[1])
 
@@ -153,15 +294,18 @@ def _urlopen(req, timeout=30):
 
 # -- Workday API -------------------------------------------------------------
 
+
 def workday_search(employer: dict, search_text: str, limit: int = 20, offset: int = 0) -> dict:
     """Search jobs via Workday CXS API. Returns JSON with total + jobPostings."""
     url = f"{employer['base_url']}/wday/cxs/{employer['tenant']}/{employer['site_id']}/jobs"
-    payload = json.dumps({
-        "appliedFacets": {},
-        "limit": limit,
-        "offset": offset,
-        "searchText": search_text,
-    }).encode()
+    payload = json.dumps(
+        {
+            "appliedFacets": {},
+            "limit": limit,
+            "offset": offset,
+            "searchText": search_text,
+        }
+    ).encode()
 
     req = urllib.request.Request(url, data=payload, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -186,6 +330,7 @@ def workday_detail(employer: dict, external_path: str) -> dict:
 
 # -- Search + paginate -------------------------------------------------------
 
+
 def search_employer(
     employer_key: str,
     employer: dict,
@@ -194,9 +339,10 @@ def search_employer(
     max_results: int = 0,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
+    location_policy: str = "recall_first",
 ) -> list[dict]:
-    """Search an employer, paginate through all results, optionally filter by location."""
-    log.info("%s: searching \"%s\"...", employer["name"], search_text)
+    """Search an employer and keep accepted or review-worthy location matches."""
+    log.info('%s: searching "%s"...', employer["name"], search_text)
 
     all_jobs: list[dict] = []
     offset = 0
@@ -221,18 +367,24 @@ def search_employer(
 
         for j in postings:
             loc = j.get("locationsText", "")
+            triage = LocationTriage("accept", "location_filter_disabled")
             if location_filter and accept_locs is not None and reject_locs is not None:
-                if not _location_ok(loc, accept_locs, reject_locs):
+                triage = _triage_location(loc, accept_locs, reject_locs, policy=location_policy)
+                if triage.decision == "reject":
                     continue
 
-            all_jobs.append({
-                "title": j.get("title", ""),
-                "location": loc,
-                "posted": j.get("postedOn", ""),
-                "external_path": j.get("externalPath", ""),
-                "employer_key": employer_key,
-                "employer_name": employer["name"],
-            })
+            all_jobs.append(
+                {
+                    "title": j.get("title", ""),
+                    "location": loc,
+                    "posted": j.get("postedOn", ""),
+                    "external_path": j.get("externalPath", ""),
+                    "employer_key": employer_key,
+                    "employer_name": employer["name"],
+                    "location_decision": triage.decision,
+                    "location_reason": triage.reason,
+                }
+            )
 
         offset += page_size
         page_num = offset // page_size
@@ -245,14 +397,22 @@ def search_employer(
             all_jobs = all_jobs[:max_results]
             break
 
-    log.info("%s: %d jobs found%s", employer["name"], len(all_jobs),
-             " (filtered)" if location_filter else "")
+    log.info("%s: %d jobs found%s", employer["name"], len(all_jobs), " (filtered)" if location_filter else "")
     return all_jobs
 
 
 # -- Fetch details -----------------------------------------------------------
 
-def _fetch_one_detail(employer: dict, job: dict) -> dict:
+
+def _fetch_one_detail(
+    employer: dict,
+    job: dict,
+    *,
+    location_filter: bool = True,
+    accept_locs: list[str] | None = None,
+    reject_locs: list[str] | None = None,
+    location_policy: str = "recall_first",
+) -> dict:
     """Fetch detail for a single job."""
     try:
         detail = workday_detail(employer, job["external_path"])
@@ -264,6 +424,12 @@ def _fetch_one_detail(employer: dict, job: dict) -> dict:
         job["job_req_id"] = info.get("jobReqId", "")
         job["time_type"] = info.get("timeType", "")
         job["remote_type"] = info.get("remoteType", "")
+        job["detail_location"] = _detail_location_text(info)
+
+        if location_filter and accept_locs is not None and reject_locs is not None:
+            triage = _triage_job_location(job, accept_locs, reject_locs, policy=location_policy)
+            job["location_decision"] = triage.decision
+            job["location_reason"] = triage.reason
 
     except Exception as e:
         job["full_description"] = ""
@@ -273,32 +439,105 @@ def _fetch_one_detail(employer: dict, job: dict) -> dict:
     return job
 
 
-def fetch_details(employer: dict, jobs: list[dict]) -> list[dict]:
+def fetch_details(
+    employer: dict,
+    jobs: list[dict],
+    *,
+    location_filter: bool = True,
+    accept_locs: list[str] | None = None,
+    reject_locs: list[str] | None = None,
+    location_policy: str = "recall_first",
+) -> list[dict]:
     """Fetch full description + apply URL for each job sequentially."""
     log.info("%s: fetching details for %d jobs...", employer["name"], len(jobs))
 
+    kept: list[dict] = []
     completed = 0
     errors = 0
     t0 = time.time()
 
     for job in jobs:
-        _fetch_one_detail(employer, job)
+        _fetch_one_detail(
+            employer,
+            job,
+            location_filter=location_filter,
+            accept_locs=accept_locs,
+            reject_locs=reject_locs,
+            location_policy=location_policy,
+        )
         completed += 1
         if "detail_error" in job:
             errors += 1
+        if job.get("location_decision") != "reject":
+            kept.append(job)
 
         if completed % 20 == 0 or completed == len(jobs):
             elapsed = time.time() - t0
             rate = completed / elapsed if elapsed > 0 else 0
-            log.info("%s: %d/%d (%d errors) [%.1f jobs/sec]",
-                     employer["name"], completed, len(jobs), errors, rate)
+            log.info("%s: %d/%d (%d errors) [%.1f jobs/sec]", employer["name"], completed, len(jobs), errors, rate)
 
     elapsed = time.time() - t0
-    log.info("%s: done in %.1fs (%.1f jobs/sec)", employer["name"], elapsed, len(jobs) / elapsed if elapsed > 0 else 0)
-    return jobs
+    log.info(
+        "%s: done in %.1fs (%.1f jobs/sec, %d kept after detail triage)",
+        employer["name"],
+        elapsed,
+        len(jobs) / elapsed if elapsed > 0 else 0,
+        len(kept),
+    )
+    return kept
+
+
+def _triage_job_location(
+    job: dict,
+    accept_locs: list[str],
+    reject_locs: list[str],
+    *,
+    policy: str = "recall_first",
+) -> LocationTriage:
+    return _triage_location(_job_location_text(job), accept_locs, reject_locs, policy=policy)
+
+
+def _job_location_text(job: dict) -> str:
+    parts = [
+        job.get("location", ""),
+        job.get("detail_location", ""),
+        job.get("remote_type", ""),
+        job.get("time_type", ""),
+    ]
+    return " | ".join(str(part) for part in parts if part)
+
+
+def _detail_location_text(info: dict) -> str:
+    """Extract structured location-ish fields from Workday detail JSON."""
+    values: list[str] = []
+    for key, value in info.items():
+        lower_key = str(key).casefold()
+        if "location" in lower_key and key != "jobDescription":
+            values.extend(_flatten_location_value(value))
+    return " | ".join(values)
+
+
+def _flatten_location_value(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [
+            str(v)
+            for k, v in value.items()
+            if isinstance(v, str) and k in {"descriptor", "name", "city", "country", "formattedLocation"}
+        ]
+    if isinstance(value, list):
+        flattened: list[str] = []
+        for item in value:
+            flattened.extend(_flatten_location_value(item))
+        return flattened
+    return []
 
 
 # -- DB storage --------------------------------------------------------------
+
 
 def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -> tuple[int, int]:
     """Store corporate jobs in DB. Returns (new, existing)."""
@@ -323,14 +562,31 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
 
         site = job.get("employer_name", "Corporate")
         strategy = "workday_api"
+        review_status = REVIEW_STATUS_MANUAL if job.get("location_decision") == "manual_review" else None
+        review_reason = f"workday_location:{job.get('location_reason', 'manual_review')}" if review_status else None
 
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, salary, description, location, site, strategy, "
-                "discovered_at, full_description, application_url, detail_scraped_at, detail_error) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), None, short_desc, job.get("location"),
-                 site, strategy, now, full_description, url, detail_scraped_at, detail_error),
+                "discovered_at, full_description, application_url, detail_scraped_at, detail_error, "
+                "review_status, review_reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    url,
+                    job.get("title"),
+                    None,
+                    short_desc,
+                    job.get("location"),
+                    site,
+                    strategy,
+                    now,
+                    full_description,
+                    url,
+                    detail_scraped_at,
+                    detail_error,
+                    review_status,
+                    review_reason,
+                ),
             )
             new += 1
         except sqlite3.IntegrityError:
@@ -347,40 +603,80 @@ def _process_one(
     location_filter: bool,
     accept_locs: list[str],
     reject_locs: list[str],
+    location_policy: str,
 ) -> dict:
     """Search one employer, fetch details, store results."""
     emp = employers[employer_key]
 
     try:
         jobs = search_employer(
-            employer_key, emp, search_text,
+            employer_key,
+            emp,
+            search_text,
             location_filter=location_filter,
             accept_locs=accept_locs,
             reject_locs=reject_locs,
+            location_policy=location_policy,
         )
     except Exception as e:
         log.error("%s: ERROR searching '%s': %s", emp["name"], search_text, e)
-        return {"employer": emp["name"], "query": search_text,
-                "found": 0, "new": 0, "existing": 0, "error": str(e)}
+        emit_error(
+            "workday_employer_search_failed",
+            e,
+            stage="discover",
+            source="workday",
+            employer_key=employer_key,
+            employer=emp["name"],
+            query=search_text,
+        )
+        return {"employer": emp["name"], "query": search_text, "found": 0, "new": 0, "existing": 0, "error": str(e)}
 
     if not jobs:
-        return {"employer": emp["name"], "query": search_text,
-                "found": 0, "new": 0, "existing": 0}
+        return {"employer": emp["name"], "query": search_text, "found": 0, "new": 0, "existing": 0}
 
     try:
-        jobs = fetch_details(emp, jobs)
+        jobs = fetch_details(
+            emp,
+            jobs,
+            location_filter=location_filter,
+            accept_locs=accept_locs,
+            reject_locs=reject_locs,
+            location_policy=location_policy,
+        )
     except Exception as e:
         log.error("%s: ERROR fetching details for '%s': %s", emp["name"], search_text, e)
+        emit_error(
+            "workday_employer_detail_failed",
+            e,
+            stage="discover",
+            source="workday",
+            employer_key=employer_key,
+            employer=emp["name"],
+            query=search_text,
+            found_before_detail=len(jobs),
+        )
 
     conn = get_connection()
     new, existing = store_results(conn, jobs, employers)
     log.info("%s: %d new, %d already in DB", emp["name"], new, existing)
+    emit_event(
+        "workday_employer_finished",
+        stage="discover",
+        source="workday",
+        status="ok",
+        employer_key=employer_key,
+        employer=emp["name"],
+        query=search_text,
+        found=len(jobs),
+        new=new,
+        existing=existing,
+    )
 
-    return {"employer": emp["name"], "query": search_text,
-            "found": len(jobs), "new": new, "existing": existing}
+    return {"employer": emp["name"], "query": search_text, "found": len(jobs), "new": new, "existing": existing}
 
 
 # -- Main orchestrator -------------------------------------------------------
+
 
 def scrape_employers(
     search_text: str,
@@ -390,6 +686,7 @@ def scrape_employers(
     max_results: int = 0,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
+    location_policy: str = "recall_first",
     workers: int = 1,
 ) -> dict:
     """Run full scrape: search -> filter -> detail -> store.
@@ -422,8 +719,14 @@ def scrape_employers(
         with ThreadPoolExecutor(max_workers=min(workers, len(valid_keys))) as pool:
             futures = {
                 pool.submit(
-                    _process_one, key, employers, search_text,
-                    location_filter, accept_locs, reject_locs,
+                    _process_one,
+                    key,
+                    employers,
+                    search_text,
+                    location_filter,
+                    accept_locs,
+                    reject_locs,
+                    location_policy,
                 ): key
                 for key in valid_keys
             }
@@ -438,15 +741,28 @@ def scrape_employers(
 
                 if completed % 10 == 0 or completed == len(valid_keys):
                     elapsed = time.time() - t0
-                    log.info("[%s] Progress: %d/%d employers (%d new, %d dupes, %d errors) [%.0fs]",
-                             search_text, completed, len(valid_keys), total_new, total_existing, errors, elapsed)
+                    log.info(
+                        "[%s] Progress: %d/%d employers (%d new, %d dupes, %d errors) [%.0fs]",
+                        search_text,
+                        completed,
+                        len(valid_keys),
+                        total_new,
+                        total_existing,
+                        errors,
+                        elapsed,
+                    )
     else:
         # Sequential mode (default)
         completed = 0
         for key in valid_keys:
             result = _process_one(
-                key, employers, search_text,
-                location_filter, accept_locs, reject_locs,
+                key,
+                employers,
+                search_text,
+                location_filter,
+                accept_locs,
+                reject_locs,
+                location_policy,
             )
             completed += 1
             total_new += result["new"]
@@ -457,17 +773,27 @@ def scrape_employers(
 
             if completed % 10 == 0 or completed == len(valid_keys):
                 elapsed = time.time() - t0
-                log.info("[%s] Progress: %d/%d employers (%d new, %d dupes, %d errors) [%.0fs]",
-                         search_text, completed, len(valid_keys), total_new, total_existing, errors, elapsed)
+                log.info(
+                    "[%s] Progress: %d/%d employers (%d new, %d dupes, %d errors) [%.0fs]",
+                    search_text,
+                    completed,
+                    len(valid_keys),
+                    total_new,
+                    total_existing,
+                    errors,
+                    elapsed,
+                )
 
     elapsed = time.time() - t0
-    log.info("[%s] Done: %d found, %d new, %d dupes in %.0fs",
-             search_text, total_found, total_new, total_existing, elapsed)
+    log.info(
+        "[%s] Done: %d found, %d new, %d dupes in %.0fs", search_text, total_found, total_new, total_existing, elapsed
+    )
 
     return {"found": total_found, "new": total_new, "existing": total_existing}
 
 
 # -- Public entry point ------------------------------------------------------
+
 
 def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> dict:
     """Main entry point for Workday-based corporate job discovery.
@@ -483,14 +809,28 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
     Returns:
         Dict with stats: found, new, existing, queries.
     """
+    search_cfg = config.load_search_config()
+    if not search_cfg.get("workday_enabled", True):
+        log.info("Workday discovery disabled by searches.yaml")
+        return {"found": 0, "new": 0, "existing": 0, "queries": 0, "skipped": True}
+
     if employers is None:
         employers = load_employers()
+    else:
+        employers = _validate_employers(employers, source="provided")
+
+    requested_employers = search_cfg.get("workday_employers") or []
+    allow_broad_crawl = search_cfg.get("workday_allow_broad_crawl", False)
+    if requested_employers:
+        employers = _select_employers(employers, requested_employers)
+    elif not allow_broad_crawl:
+        log.info("Workday discovery skipped: no workday_employers configured and broad crawl is disabled")
+        return {"found": 0, "new": 0, "existing": 0, "queries": 0, "skipped": True}
 
     if not employers:
-        log.warning("No employers configured. Create config/employers.yaml.")
+        log.warning("No Workday employers configured or selected.")
         return {"found": 0, "new": 0, "existing": 0, "queries": 0}
 
-    search_cfg = config.load_search_config()
     queries_cfg = search_cfg.get("queries", [])
     accept_locs, reject_locs = _load_location_filter(search_cfg)
 
@@ -511,6 +851,7 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
         setup_proxy(proxy)
 
     location_filter = search_cfg.get("workday_location_filter", True)
+    location_policy = search_cfg.get("workday_location_policy", "recall_first")
 
     log.info("Workday crawl: %d queries x %d employers (workers=%d)", len(queries), len(employers), workers)
 
@@ -519,21 +860,28 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
     grand_found = 0
 
     for i, query in enumerate(queries, 1):
-        log.info("Query %d/%d: \"%s\"", i, len(queries), query)
+        log.info('Query %d/%d: "%s"', i, len(queries), query)
         result = scrape_employers(
             search_text=query,
             employers=employers,
             location_filter=location_filter,
             accept_locs=accept_locs,
             reject_locs=reject_locs,
+            location_policy=location_policy,
             workers=workers,
         )
         grand_new += result["new"]
         grand_existing += result["existing"]
         grand_found += result["found"]
 
-    log.info("Workday crawl done: %d found, %d new, %d existing across %d queries x %d employers",
-             grand_found, grand_new, grand_existing, len(queries), len(employers))
+    log.info(
+        "Workday crawl done: %d found, %d new, %d existing across %d queries x %d employers",
+        grand_found,
+        grand_new,
+        grand_existing,
+        len(queries),
+        len(employers),
+    )
 
     return {
         "found": grand_found,
@@ -541,3 +889,29 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
         "existing": grand_existing,
         "queries": len(queries),
     }
+
+
+def _select_employers(employers: dict, requested: list[str]) -> dict:
+    """Filter employer registry by configured keys or display names."""
+    if isinstance(requested, str):
+        requested = [requested]
+    selected = {}
+    missing = []
+    for item in requested:
+        wanted = _normalise_name(item)
+        match = None
+        for key, employer in employers.items():
+            if wanted in {_normalise_name(key), _normalise_name(employer.get("name", ""))}:
+                match = key
+                break
+        if match:
+            selected[match] = employers[match]
+        else:
+            missing.append(str(item))
+    if missing:
+        log.warning("Configured Workday employers not found: %s", ", ".join(missing))
+    return selected
+
+
+def _normalise_name(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
