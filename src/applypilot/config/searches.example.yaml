@@ -102,6 +102,24 @@ workday_location_policy: recall_first
 workday_max_tier: 2
 workday_employers: []
 
+# Optional train-time gate for Dutch hybrid or on-site roles. Remote/EU/EMEA
+# roles are handled before this check. Unknown Dutch cities are kept for
+# review instead of auto-apply.
+location_train_policy:
+  enabled: true
+  max_minutes: 100
+  unknown_city: manual_review
+  anchors:
+    - station: Den Haag Centraal
+      code: GVC
+    - station: Rotterdam Centraal
+      code: RTD
+  source:
+    static_table: true
+    ns_api_fallback: true
+    cache_path: C:\Users\latvi\.applypilot\train_commute_cache.json
+    max_api_lookups_per_run: 10
+
 # Curated high-value company career pages. Empty allowlist means skip.
 priority_company_sources_enabled: true
 priority_company_max_tier: 3

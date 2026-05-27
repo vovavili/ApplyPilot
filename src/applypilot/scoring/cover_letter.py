@@ -627,10 +627,17 @@ def _load_jobs_needing_cover_letters(conn, min_score: int = 7, limit: int = 20) 
         return []
 
     jobs = [dict(zip(row.keys(), row)) for row in rows]
-    accept_locs, reject_locs = workday._load_location_filter(load_search_config())
+    search_cfg = load_search_config()
+    accept_locs, reject_locs = workday._load_location_filter(search_cfg)
     accepted: list[dict] = []
     for job in jobs:
-        triage = workday._triage_location(job.get("location"), accept_locs, reject_locs, policy="recall_first")
+        triage = workday._triage_location(
+            job.get("location"),
+            accept_locs,
+            reject_locs,
+            policy="recall_first",
+            search_cfg=search_cfg,
+        )
         if triage.decision != "accept":
             log.info(
                 "Skipping cover letter for %s at %s: location_%s:%s",

@@ -292,13 +292,13 @@ def _scrape_source(
 ) -> list[dict]:
     platform = company["platform"]
     if platform == "greenhouse":
-        return _scrape_greenhouse(key, company, queries, accept_locs, reject_locs, location_policy)
+        return _scrape_greenhouse(key, company, queries, accept_locs, reject_locs, location_policy, search_cfg)
     if platform == "lever":
-        return _scrape_lever(key, company, queries, accept_locs, reject_locs, location_policy)
+        return _scrape_lever(key, company, queries, accept_locs, reject_locs, location_policy, search_cfg)
     if platform == "workday":
-        return _scrape_workday_bridge(key, company, queries, accept_locs, reject_locs, location_policy)
+        return _scrape_workday_bridge(key, company, queries, accept_locs, reject_locs, location_policy, search_cfg)
     if platform == "netflix":
-        return _scrape_netflix(key, company, queries, accept_locs, reject_locs, location_policy)
+        return _scrape_netflix(key, company, queries, accept_locs, reject_locs, location_policy, search_cfg)
     if platform == "uber":
         return _scrape_uber(key, company, queries, accept_locs, reject_locs, location_policy, search_cfg)
     raise ValueError(f"Unsupported priority company platform: {platform}")
@@ -314,6 +314,7 @@ def _scrape_greenhouse(
     accept_locs: list[str],
     reject_locs: list[str],
     location_policy: str,
+    search_cfg: dict | None = None,
 ) -> list[dict]:
     board = company["board"]
     data = _http_get_json(f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs?content=true")
@@ -333,7 +334,7 @@ def _scrape_greenhouse(
             location=location,
             full_description=full_description,
         )
-        jobs.extend(_triaged_job(job, accept_locs, reject_locs, location_policy))
+        jobs.extend(_triaged_job(job, accept_locs, reject_locs, location_policy, search_cfg))
     return jobs
 
 
@@ -344,6 +345,7 @@ def _scrape_lever(
     accept_locs: list[str],
     reject_locs: list[str],
     location_policy: str,
+    search_cfg: dict | None = None,
 ) -> list[dict]:
     account = company["account"]
     data = _http_get_json(f"https://api.lever.co/v0/postings/{account}?mode=json")
@@ -365,7 +367,7 @@ def _scrape_lever(
             full_description=full_description,
             salary=_lever_salary(item),
         )
-        jobs.extend(_triaged_job(job, accept_locs, reject_locs, location_policy))
+        jobs.extend(_triaged_job(job, accept_locs, reject_locs, location_policy, search_cfg))
     return jobs
 
 
@@ -376,6 +378,7 @@ def _scrape_workday_bridge(
     accept_locs: list[str],
     reject_locs: list[str],
     location_policy: str,
+    search_cfg: dict | None = None,
 ) -> list[dict]:
     employer_key = company["employer_key"]
     employers = workday.load_employers()
@@ -393,6 +396,7 @@ def _scrape_workday_bridge(
             accept_locs=accept_locs,
             reject_locs=reject_locs,
             location_policy=location_policy,
+            search_cfg=search_cfg,
         )
         detailed = workday.fetch_details(
             employer,
@@ -401,6 +405,7 @@ def _scrape_workday_bridge(
             accept_locs=accept_locs,
             reject_locs=reject_locs,
             location_policy=location_policy,
+            search_cfg=search_cfg,
         )
         for item in detailed:
             url = (
@@ -428,10 +433,11 @@ def _scrape_netflix(
     accept_locs: list[str],
     reject_locs: list[str],
     location_policy: str,
+    search_cfg: dict | None = None,
 ) -> list[dict]:
     url = company.get("url") or NETFLIX_AMSTERDAM_URL
     html = _http_get_text(url)
-    jobs = _scrape_netflix_static(key, company, html, queries, accept_locs, reject_locs, location_policy)
+    jobs = _scrape_netflix_static(key, company, html, queries, accept_locs, reject_locs, location_policy, search_cfg)
     if not jobs:
         jobs = _scrape_rendered_job_links(
             url,
@@ -442,6 +448,7 @@ def _scrape_netflix(
             accept_locs=accept_locs,
             reject_locs=reject_locs,
             location_policy=location_policy,
+            search_cfg=search_cfg,
         )
     return _dedupe_jobs(jobs)
 
@@ -454,6 +461,7 @@ def _scrape_netflix_static(
     accept_locs: list[str],
     reject_locs: list[str],
     location_policy: str,
+    search_cfg: dict | None = None,
 ) -> list[dict]:
     text = unescape(html)
     positions = _extract_json_array_after_key(text, '"positions"')
@@ -476,7 +484,7 @@ def _scrape_netflix_static(
             location=location,
             full_description=full_description,
         )
-        jobs.extend(_triaged_job(job, accept_locs, reject_locs, location_policy))
+        jobs.extend(_triaged_job(job, accept_locs, reject_locs, location_policy, search_cfg))
     return jobs
 
 
@@ -502,6 +510,7 @@ def _scrape_uber(
             accept_locs,
             reject_locs,
             location_policy,
+            search_cfg,
         )
         if api_jobs:
             jobs.extend(api_jobs)
@@ -517,6 +526,7 @@ def _scrape_uber(
             accept_locs=accept_locs,
             reject_locs=reject_locs,
             location_policy=location_policy,
+            search_cfg=search_cfg,
         )
         if not parsed:
             parsed = _scrape_rendered_job_links(
@@ -528,6 +538,7 @@ def _scrape_uber(
                 accept_locs=accept_locs,
                 reject_locs=reject_locs,
                 location_policy=location_policy,
+                search_cfg=search_cfg,
             )
         jobs.extend(parsed)
 
@@ -542,6 +553,7 @@ def _scrape_uber_api(
     accept_locs: list[str],
     reject_locs: list[str],
     location_policy: str,
+    search_cfg: dict | None = None,
 ) -> list[dict]:
     jobs = []
     location_filters = _uber_location_filters(location)
@@ -575,7 +587,7 @@ def _scrape_uber_api(
                 location=_uber_location(item),
                 full_description=item.get("description", ""),
             )
-            jobs.extend(_triaged_job(job, accept_locs, reject_locs, location_policy))
+            jobs.extend(_triaged_job(job, accept_locs, reject_locs, location_policy, search_cfg))
 
         total = ((data or {}).get("data") or {}).get("totalResults") or {}
         total_low = int(total.get("low") or 0) if isinstance(total, dict) else 0
@@ -592,6 +604,7 @@ def _scrape_uber_static(
     accept_locs: list[str],
     reject_locs: list[str],
     location_policy: str,
+    search_cfg: dict | None = None,
 ) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     jobs = []
@@ -611,7 +624,7 @@ def _scrape_uber_static(
             location=location,
             full_description="",
         )
-        jobs.extend(_triaged_job(job, accept_locs, reject_locs, location_policy))
+        jobs.extend(_triaged_job(job, accept_locs, reject_locs, location_policy, search_cfg))
     return jobs
 
 
@@ -737,8 +750,15 @@ def _triaged_job(
     accept_locs: list[str],
     reject_locs: list[str],
     location_policy: str,
+    search_cfg: dict | None = None,
 ) -> list[dict]:
-    triage = workday._triage_location(job.get("location"), accept_locs, reject_locs, policy=location_policy)
+    triage = workday._triage_location(
+        job.get("location"),
+        accept_locs,
+        reject_locs,
+        policy=location_policy,
+        search_cfg=search_cfg,
+    )
     if triage.decision == "reject":
         return []
     return [{**job, "location_decision": triage.decision, "location_reason": triage.reason}]
@@ -842,6 +862,7 @@ def _scrape_rendered_job_links(
     accept_locs: list[str],
     reject_locs: list[str],
     location_policy: str,
+    search_cfg: dict | None = None,
 ) -> list[dict]:
     try:
         from playwright.sync_api import sync_playwright
@@ -889,7 +910,7 @@ def _scrape_rendered_job_links(
             url=href,
             location=location,
         )
-        jobs.extend(_triaged_job(job, accept_locs, reject_locs, location_policy))
+        jobs.extend(_triaged_job(job, accept_locs, reject_locs, location_policy, search_cfg))
     return _dedupe_jobs(jobs)
 
 

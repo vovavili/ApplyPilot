@@ -31,6 +31,31 @@ A ready job must pass all of these checks:
 `approved_with_judge_warning` is deliberately not ready. It may be fine after a
 human reads it, but the bot should not submit it unattended.
 
+## Dutch train commute gate
+
+Dutch hybrid and office roles now go through a train-time check instead of a
+plain string or distance check. A physical Dutch role is accepted only when its
+city is reachable within the configured limit from Den Haag Centraal or
+Rotterdam Centraal. The current default is 100 minutes one way.
+
+The gate checks remote, EU, Europe, and EMEA wording first. Those roles keep the
+old behavior. For physical Dutch locations, ApplyPilot parses the city and checks
+a small static commute table. Common Randstad locations such as Amsterdam,
+Rotterdam, Den Haag, Utrecht, Delft, Leiden, Rijswijk, Gouda, Haarlem,
+Hoofddorp, Amersfoort, Breda, and Schiphol are covered there.
+
+Unknown Dutch cities, province-only locations, vague values like "Multiple
+Locations", and NS API failures go to `manual_review`. They stay in the database,
+but they do not get cover letters or enter the apply queue. Maastricht is
+rejected in the current user config because it is explicitly listed in
+`location_reject_non_remote`.
+
+If `NS_API_KEY` is set, ApplyPilot may use the NS travel information API as a
+fallback for unknown city or station names. Results are cached in
+`C:\Users\latvi\.applypilot\train_commute_cache.json`. If the API key is absent,
+invalid, rate-limited, or returns an ambiguous station or no route, the job goes
+to `manual_review`.
+
 ## Cover letter generation
 
 Cover letters now use a structured path. The model returns six JSON fields, and

@@ -191,7 +191,13 @@ def _check_required_fields(job: dict, result: ReadinessResult, min_score: int) -
 def _check_location(job: dict, result: ReadinessResult) -> None:
     search_cfg = config.load_search_config()
     accept_locs, reject_locs = workday._load_location_filter(search_cfg)
-    triage = workday._triage_location(job.get("location"), accept_locs, reject_locs, policy="recall_first")
+    triage = workday._triage_location(
+        job.get("location"),
+        accept_locs,
+        reject_locs,
+        policy="recall_first",
+        search_cfg=search_cfg,
+    )
     if triage.decision != "accept":
         result.fail(f"location_{triage.decision}:{triage.reason}")
 
