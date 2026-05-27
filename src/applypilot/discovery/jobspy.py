@@ -16,9 +16,11 @@ from jobspy import scrape_jobs
 
 from applypilot import config
 from applypilot.database import get_connection, init_db
+from applypilot.discovery import workday
 from applypilot.events import emit_error, emit_event
 
 log = logging.getLogger(__name__)
+MISSING_TEXT_VALUES = {"", "none", "null", "nan", "n/a", "na"}
 
 
 # -- Proxy parsing -----------------------------------------------------------
@@ -87,33 +89,28 @@ def _load_location_config(search_cfg: dict) -> tuple[list[str], list[str]]:
     return accept, reject
 
 
-def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
+def _location_ok(
+    location: str | None,
+    accept: list[str],
+    reject: list[str],
+    search_cfg: dict | None = None,
+) -> bool:
     """Check if a job location passes the user's location filter.
 
     Remote jobs are always accepted. Non-remote jobs must match an accept
     pattern and not match a reject pattern.
     """
-    if not location:
-        return True  # unknown location -- keep it, let scorer decide
+    return (
+        workday._triage_location(location, accept, reject, policy="recall_first", search_cfg=search_cfg).decision
+        == "accept"
+    )
 
-    loc = location.lower()
 
-    # Remote jobs always OK
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-
-    # Reject non-remote matches
-    for r in reject:
-        if r.lower() in loc:
-            return False
-
-    # Accept matches
-    for a in accept:
-        if a.lower() in loc:
-            return True
-
-    # No match -- reject unknown
-    return False
+def _optional_text(value) -> str | None:
+    text = str(value or "").strip()
+    if text.casefold() in MISSING_TEXT_VALUES:
+        return None
+    return text
 
 
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
@@ -166,13 +163,15 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             detail_scraped_at = now
 
         # Extract apply URL if JobSpy provided it
-        apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
+        apply_url = _optional_text(row.get("job_url_direct"))
+        review_status = "manual_review" if row.get("_location_decision") == "manual_review" else None
+        review_reason = f"jobspy_location:{row.get('_location_reason')}" if review_status else None
 
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, discovered_at, "
-                "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "full_description, application_url, detail_scraped_at, review_status, review_reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     url,
                     title,
@@ -186,6 +185,8 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
                     full_description,
                     apply_url,
                     detail_scraped_at,
+                    review_status,
+                    review_reason,
                 ),
             )
             new += 1
@@ -210,6 +211,7 @@ def _run_one_search(
     accept_locs: list[str],
     reject_locs: list[str],
     glassdoor_map: dict,
+    search_cfg: dict | None = None,
 ) -> dict:
     """Run a single search query and store results in DB."""
     s = search
@@ -308,19 +310,33 @@ def _run_one_search(
         log.info("[%s] 0 results", label)
         return {"new": 0, "existing": 0, "errors": 0, "filtered": 0, "total": 0, "label": label}
 
-    # Filter by location before storing
+    # Triage location before storing: rejects are dropped, ambiguous rows are kept
+    # as manual_review so they cannot advance to apply without a human decision.
     before = len(df)
-    df = df[
-        df.apply(
-            lambda row: _location_ok(
-                str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None,
-                accept_locs,
-                reject_locs,
-            ),
-            axis=1,
-        )
-    ]
+    triages = df.apply(
+        lambda row: workday._triage_location(
+            str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None,
+            accept_locs,
+            reject_locs,
+            policy="recall_first",
+            search_cfg=search_cfg,
+        ),
+        axis=1,
+    )
+    df = df.assign(
+        _location_decision=[triage.decision for triage in triages],
+        _location_reason=[triage.reason for triage in triages],
+    )
+    df = df[df["_location_decision"] != "reject"]
+    manual_review = int((df["_location_decision"] == "manual_review").sum()) if len(df) else 0
     filtered = before - len(df)
+
+    if manual_review:
+        log.info(
+            "[%s] kept %d ambiguous location result(s) as manual_review",
+            label,
+            manual_review,
+        )
 
     conn = get_connection()
     new, existing = store_jobspy_results(conn, df, s["query"])
@@ -328,6 +344,8 @@ def _run_one_search(
     msg = f"[{label}] {before} results -> {new} new, {existing} dupes"
     if filtered:
         msg += f", {filtered} filtered (location)"
+    if manual_review:
+        msg += f", {manual_review} manual_review"
     log.info(msg)
     emit_event(
         "jobspy_search_finished",
@@ -488,6 +506,7 @@ def _full_crawl(
             accept_locs,
             reject_locs,
             glassdoor_map,
+            search_cfg,
         )
         completed += 1
         total_new += result["new"]

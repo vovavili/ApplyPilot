@@ -14,7 +14,6 @@ import sqlite3
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 
@@ -23,6 +22,7 @@ import yaml
 from applypilot import config
 from applypilot.config import CONFIG_DIR
 from applypilot.database import get_connection, init_db
+from applypilot.discovery.location import LocationTriage, triage_location
 from applypilot.events import emit_error, emit_event
 
 log = logging.getLogger(__name__)
@@ -46,8 +46,6 @@ EUROPE_TERMS = (
 )
 SHORT_EU_TERMS = ("eu",)
 NL_TERMS = (
-    "netherlands",
-    "nederland",
     "amsterdam",
     "rotterdam",
     "utrecht",
@@ -55,10 +53,7 @@ NL_TERMS = (
     "den haag",
     "delft",
     "leiden",
-    "eindhoven",
-    "north holland",
     "south holland",
-    "noord-holland",
     "zuid-holland",
 )
 VAGUE_LOCATION_TERMS = (
@@ -71,12 +66,6 @@ VAGUE_LOCATION_TERMS = (
     "hybrid",
 )
 WORKDAY_REQUIRED_EMPLOYER_FIELDS = ("name", "tenant", "site_id", "base_url")
-
-
-@dataclass(frozen=True)
-class LocationTriage:
-    decision: str
-    reason: str
 
 
 # -- Employer registry from YAML --------------------------------------------
@@ -138,9 +127,14 @@ def _load_location_filter(search_cfg: dict | None = None):
     return accept, reject
 
 
-def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
+def _location_ok(
+    location: str | None,
+    accept: list[str],
+    reject: list[str],
+    search_cfg: dict | None = None,
+) -> bool:
     """Backward-compatible boolean wrapper around Workday location triage."""
-    return _triage_location(location, accept, reject).decision == "accept"
+    return _triage_location(location, accept, reject, search_cfg=search_cfg).decision == "accept"
 
 
 def _triage_location(
@@ -149,35 +143,10 @@ def _triage_location(
     reject: list[str],
     *,
     policy: str = "recall_first",
+    search_cfg: dict | None = None,
 ) -> LocationTriage:
     """Classify a Workday location as accepted, manual-review, or rejected."""
-    text = str(location or "").strip()
-    if not text:
-        return _ambiguous_location(policy, "blank_location")
-
-    loc = text.casefold()
-
-    if _contains_any(loc, NL_TERMS):
-        return LocationTriage("accept", "accepted_nl_or_configured")
-
-    if _contains_any(loc, EUROPE_TERMS) or _contains_short_term(loc, SHORT_EU_TERMS):
-        return LocationTriage("accept", "accepted_europe_emea")
-
-    if _contains_any(loc, REMOTE_TERMS):
-        if _contains_any(loc, reject):
-            return LocationTriage("reject", "rejected_remote_restricted_foreign")
-        return LocationTriage("accept", "accepted_remote")
-
-    if _contains_accept_term(loc, accept):
-        return LocationTriage("accept", "accepted_nl_or_configured")
-
-    if _contains_any(loc, VAGUE_LOCATION_TERMS):
-        return _ambiguous_location(policy, "ambiguous_location")
-
-    if _contains_any(loc, reject):
-        return LocationTriage("reject", "rejected_non_remote_foreign")
-
-    return _ambiguous_location(policy, "unmatched_location")
+    return triage_location(location, accept, reject, policy=policy, search_cfg=search_cfg)
 
 
 def _ambiguous_location(policy: str, reason: str) -> LocationTriage:
@@ -340,6 +309,7 @@ def search_employer(
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
     location_policy: str = "recall_first",
+    search_cfg: dict | None = None,
 ) -> list[dict]:
     """Search an employer and keep accepted or review-worthy location matches."""
     log.info('%s: searching "%s"...', employer["name"], search_text)
@@ -369,7 +339,13 @@ def search_employer(
             loc = j.get("locationsText", "")
             triage = LocationTriage("accept", "location_filter_disabled")
             if location_filter and accept_locs is not None and reject_locs is not None:
-                triage = _triage_location(loc, accept_locs, reject_locs, policy=location_policy)
+                triage = _triage_location(
+                    loc,
+                    accept_locs,
+                    reject_locs,
+                    policy=location_policy,
+                    search_cfg=search_cfg,
+                )
                 if triage.decision == "reject":
                     continue
 
@@ -412,6 +388,7 @@ def _fetch_one_detail(
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
     location_policy: str = "recall_first",
+    search_cfg: dict | None = None,
 ) -> dict:
     """Fetch detail for a single job."""
     try:
@@ -427,7 +404,13 @@ def _fetch_one_detail(
         job["detail_location"] = _detail_location_text(info)
 
         if location_filter and accept_locs is not None and reject_locs is not None:
-            triage = _triage_job_location(job, accept_locs, reject_locs, policy=location_policy)
+            triage = _triage_job_location(
+                job,
+                accept_locs,
+                reject_locs,
+                policy=location_policy,
+                search_cfg=search_cfg,
+            )
             job["location_decision"] = triage.decision
             job["location_reason"] = triage.reason
 
@@ -447,6 +430,7 @@ def fetch_details(
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
     location_policy: str = "recall_first",
+    search_cfg: dict | None = None,
 ) -> list[dict]:
     """Fetch full description + apply URL for each job sequentially."""
     log.info("%s: fetching details for %d jobs...", employer["name"], len(jobs))
@@ -464,6 +448,7 @@ def fetch_details(
             accept_locs=accept_locs,
             reject_locs=reject_locs,
             location_policy=location_policy,
+            search_cfg=search_cfg,
         )
         completed += 1
         if "detail_error" in job:
@@ -493,8 +478,9 @@ def _triage_job_location(
     reject_locs: list[str],
     *,
     policy: str = "recall_first",
+    search_cfg: dict | None = None,
 ) -> LocationTriage:
-    return _triage_location(_job_location_text(job), accept_locs, reject_locs, policy=policy)
+    return _triage_location(_job_location_text(job), accept_locs, reject_locs, policy=policy, search_cfg=search_cfg)
 
 
 def _job_location_text(job: dict) -> str:
@@ -604,6 +590,7 @@ def _process_one(
     accept_locs: list[str],
     reject_locs: list[str],
     location_policy: str,
+    search_cfg: dict | None = None,
 ) -> dict:
     """Search one employer, fetch details, store results."""
     emp = employers[employer_key]
@@ -617,6 +604,7 @@ def _process_one(
             accept_locs=accept_locs,
             reject_locs=reject_locs,
             location_policy=location_policy,
+            search_cfg=search_cfg,
         )
     except Exception as e:
         log.error("%s: ERROR searching '%s': %s", emp["name"], search_text, e)
@@ -642,6 +630,7 @@ def _process_one(
             accept_locs=accept_locs,
             reject_locs=reject_locs,
             location_policy=location_policy,
+            search_cfg=search_cfg,
         )
     except Exception as e:
         log.error("%s: ERROR fetching details for '%s': %s", emp["name"], search_text, e)
@@ -687,6 +676,7 @@ def scrape_employers(
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
     location_policy: str = "recall_first",
+    search_cfg: dict | None = None,
     workers: int = 1,
 ) -> dict:
     """Run full scrape: search -> filter -> detail -> store.
@@ -727,6 +717,7 @@ def scrape_employers(
                     accept_locs,
                     reject_locs,
                     location_policy,
+                    search_cfg,
                 ): key
                 for key in valid_keys
             }
@@ -763,6 +754,7 @@ def scrape_employers(
                 accept_locs,
                 reject_locs,
                 location_policy,
+                search_cfg,
             )
             completed += 1
             total_new += result["new"]
@@ -868,6 +860,7 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
             accept_locs=accept_locs,
             reject_locs=reject_locs,
             location_policy=location_policy,
+            search_cfg=search_cfg,
             workers=workers,
         )
         grand_new += result["new"]

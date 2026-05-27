@@ -16,6 +16,7 @@ from applypilot.events import emit_event
 from applypilot.scoring.validator import validate_cover_letter
 
 READY_STATUS_APPROVED = "approved"
+MISSING_URL_VALUES = {"", "none", "null", "nan", "n/a", "na"}
 
 
 @dataclass
@@ -45,6 +46,16 @@ class ReadinessResult:
 def expected_url_digest(url: str) -> str:
     """Return the short URL digest used in generated artifact filenames."""
     return sha1(str(url).encode("utf-8")).hexdigest()[:8]
+
+
+def usable_url(value: Any) -> str | None:
+    """Return a usable HTTP(S) URL, treating common scraped placeholders as missing."""
+    text = str(value or "").strip()
+    if text.casefold() in MISSING_URL_VALUES:
+        return None
+    if not text.startswith(("http://", "https://")):
+        return None
+    return text
 
 
 def check_job_ready(
@@ -180,7 +191,7 @@ def _check_required_fields(job: dict, result: ReadinessResult, min_score: int) -
         result.fail("manual_review")
     if (job.get("fit_score") or 0) < min_score:
         result.fail("score_below_minimum")
-    if not job.get("application_url"):
+    if not usable_url(job.get("application_url")) and not usable_url(job.get("url")):
         result.fail("missing_application_url")
     if not job.get("tailored_resume_path"):
         result.fail("missing_tailored_resume_path")
@@ -191,7 +202,13 @@ def _check_required_fields(job: dict, result: ReadinessResult, min_score: int) -
 def _check_location(job: dict, result: ReadinessResult) -> None:
     search_cfg = config.load_search_config()
     accept_locs, reject_locs = workday._load_location_filter(search_cfg)
-    triage = workday._triage_location(job.get("location"), accept_locs, reject_locs, policy="recall_first")
+    triage = workday._triage_location(
+        job.get("location"),
+        accept_locs,
+        reject_locs,
+        policy="recall_first",
+        search_cfg=search_cfg,
+    )
     if triage.decision != "accept":
         result.fail(f"location_{triage.decision}:{triage.reason}")
 

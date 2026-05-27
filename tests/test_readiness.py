@@ -45,6 +45,28 @@ def _search_config() -> dict:
     }
 
 
+def _train_search_config() -> dict:
+    return {
+        "location_accept": ["Remote", "Europe", "EU", "EMEA"],
+        "location_reject_non_remote": ["India", "Canada", "United States", "Maastricht", "Limburg"],
+        "location_train_policy": {
+            "enabled": True,
+            "max_minutes": 100,
+            "unknown_city": "manual_review",
+            "anchors": [
+                {"station": "Den Haag Centraal", "code": "GVC"},
+                {"station": "Rotterdam Centraal", "code": "RTD"},
+            ],
+            "source": {
+                "static_table": True,
+                "ns_api_fallback": False,
+                "cache_path": "",
+                "max_api_lookups_per_run": 0,
+            },
+        },
+    }
+
+
 def _job(url: str = "https://example.com/jobs/1", **overrides) -> dict:
     job = {
         "url": url,
@@ -175,6 +197,49 @@ def test_readiness_blocks_current_bad_location_examples(monkeypatch, tmp_path, l
     conn.close()
 
 
+@pytest.mark.parametrize(
+    ("location", "reason_part"),
+    [
+        ("Maastricht, Limburg, Netherlands", "location_reject:rejected_non_remote_foreign"),
+        ("North Brabant, Netherlands", "location_manual_review:province_only_location"),
+        ("Enkhuizen, North Holland, Netherlands", "location_manual_review:unknown_city"),
+        ("Zaltbommel, Gelderland, Netherlands", "location_manual_review:unknown_city"),
+        ("Renswoude, Utrecht, Netherlands", "location_manual_review:unknown_city"),
+    ],
+)
+def test_train_commute_policy_blocks_existing_bad_dutch_rows(monkeypatch, tmp_path, location, reason_part):
+    conn = init_db(tmp_path / "applypilot.db")
+    job = _job(f"https://example.com/jobs/{location.replace(' ', '-')}", location=location)
+    _insert_prepped_job(conn, job, *_write_artifacts(tmp_path, job))
+    _patch_environment(monkeypatch, conn)
+    monkeypatch.setattr(app_config, "load_search_config", _train_search_config)
+
+    row = conn.execute("SELECT * FROM jobs WHERE url = ?", (job["url"],)).fetchone()
+    readiness = check_job_ready(row, conn, profile=_profile())
+
+    assert not readiness.ready
+    assert reason_part in readiness.reasons
+    assert count_ready_to_apply(conn) == 0
+    assert launcher.acquire_job(target_url=job["url"], min_score=7, worker_id=1) is None
+    conn.close()
+
+
+def test_train_commute_policy_keeps_randstad_rows_ready(monkeypatch, tmp_path):
+    conn = init_db(tmp_path / "applypilot.db")
+    job = _job("https://example.com/jobs/randstad", location="Breda, North Brabant, Netherlands")
+    _insert_prepped_job(conn, job, *_write_artifacts(tmp_path, job))
+    _patch_environment(monkeypatch, conn)
+    monkeypatch.setattr(app_config, "load_search_config", _train_search_config)
+
+    row = conn.execute("SELECT * FROM jobs WHERE url = ?", (job["url"],)).fetchone()
+    readiness = check_job_ready(row, conn, profile=_profile())
+
+    assert readiness.ready
+    assert count_ready_to_apply(conn) == 1
+    assert launcher.acquire_job(target_url=job["url"], min_score=7, worker_id=1)["url"] == job["url"]
+    conn.close()
+
+
 def test_readiness_blocks_duplicate_artifact_paths(monkeypatch, tmp_path):
     conn = init_db(tmp_path / "applypilot.db")
     first = _job("https://example.com/jobs/1")
@@ -232,6 +297,37 @@ def test_acquire_job_refuses_target_that_fails_readiness(monkeypatch, tmp_path):
 
     assert acquired is None
     assert conn.execute("SELECT apply_status FROM jobs").fetchone()[0] is None
+    conn.close()
+
+
+@pytest.mark.parametrize("application_url", ["", "None", " none ", "NULL", "nan", "N/A", "ftp://example.com/apply"])
+def test_readiness_allows_placeholder_application_url_when_job_url_is_usable(monkeypatch, tmp_path, application_url):
+    conn = init_db(tmp_path / "applypilot.db")
+    job = _job(application_url=application_url)
+    _insert_prepped_job(conn, job, *_write_artifacts(tmp_path, job))
+    _patch_environment(monkeypatch, conn)
+
+    row = conn.execute("SELECT * FROM jobs WHERE url = ?", (job["url"],)).fetchone()
+    readiness = check_job_ready(row, conn, profile=_profile())
+
+    assert readiness.ready
+    assert "missing_application_url" not in readiness.reasons
+    assert launcher.acquire_job(target_url=job["url"], min_score=7, worker_id=1)["url"] == job["url"]
+    conn.close()
+
+
+def test_readiness_blocks_when_both_application_and_job_urls_are_unusable(monkeypatch, tmp_path):
+    conn = init_db(tmp_path / "applypilot.db")
+    job = _job(url="None", application_url="None")
+    _insert_prepped_job(conn, job, *_write_artifacts(tmp_path, {"url": "https://example.com/jobs/1", **job}))
+    _patch_environment(monkeypatch, conn)
+
+    row = conn.execute("SELECT * FROM jobs").fetchone()
+    readiness = check_job_ready(row, conn, profile=_profile())
+
+    assert not readiness.ready
+    assert "missing_application_url" in readiness.reasons
+    assert launcher.acquire_job(target_url="None", min_score=7, worker_id=1) is None
     conn.close()
 
 

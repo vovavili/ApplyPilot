@@ -26,7 +26,7 @@ from rich.live import Live
 from applypilot import config
 from applypilot.database import get_connection
 from applypilot.events import emit_event
-from applypilot.readiness import check_job_ready
+from applypilot.readiness import check_job_ready, usable_url
 from applypilot.apply import prompt as prompt_mod
 from applypilot.apply.salary import salary_rejection_reason
 from applypilot.apply.chrome import (
@@ -189,7 +189,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7, worker_id: in
             # Skip manual ATS sites (unsolvable CAPTCHAs)
             from applypilot.config import is_manual_ats
 
-            apply_url = row["application_url"] or row["url"]
+            apply_url = usable_url(row["application_url"]) or usable_url(row["url"]) or ""
             if is_manual_ats(apply_url):
                 conn.execute(
                     "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
@@ -560,7 +560,7 @@ def run_job(job: dict, port: int, worker_id: int = 0, model: str = "sonnet", dry
         def _clean_reason(s: str) -> str:
             return re.sub(r'[*`"]+$', "", s).strip()
 
-        for result_status in ["APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
+        for result_status in ["APPLIED", "DRY_RUN", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
             if f"RESULT:{result_status}" in output:
                 add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
                 update_state(worker_id, status=result_status.lower(), last_action=f"{result_status} ({elapsed}s)")
@@ -707,9 +707,11 @@ def worker_loop(
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id, model=model, dry_run=dry_run)
 
-            if result == "skipped":
+            if result in {"skipped", "dry_run"}:
                 release_lock(job["url"])
-                add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
+                add_event(
+                    f"[W{worker_id}] {'Dry run complete' if result == 'dry_run' else 'Skipped'}: {job['title'][:30]}"
+                )
                 continue
             elif result == "applied":
                 mark_result(job["url"], "applied", duration_ms=duration_ms)

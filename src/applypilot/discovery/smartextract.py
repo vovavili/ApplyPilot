@@ -29,6 +29,7 @@ from playwright.sync_api import sync_playwright
 from applypilot import config
 from applypilot.config import CONFIG_DIR
 from applypilot.database import init_db, get_stats
+from applypilot.discovery import workday
 from applypilot.llm import get_client
 from applypilot.playwright_utils import launch_chromium
 
@@ -57,20 +58,17 @@ def _load_location_filter(search_cfg: dict | None = None):
     return accept, reject
 
 
-def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
+def _location_ok(
+    location: str | None,
+    accept: list[str],
+    reject: list[str],
+    search_cfg: dict | None = None,
+) -> bool:
     """Check if a job location passes the user's location filter."""
-    if not location:
-        return True
-    loc = location.lower()
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-    for r in reject:
-        if r.lower() in loc:
-            return False
-    for a in accept:
-        if a.lower() in loc:
-            return True
-    return False
+    return (
+        workday._triage_location(location, accept, reject, policy="recall_first", search_cfg=search_cfg).decision
+        == "accept"
+    )
 
 
 # -- Site configuration from YAML --------------------------------------------
@@ -125,6 +123,7 @@ def _store_jobs_filtered(
     strategy: str,
     accept_locs: list[str],
     reject_locs: list[str],
+    search_cfg: dict | None = None,
 ) -> tuple[int, int]:
     """Store jobs with location filtering. Returns (new, existing)."""
     now = datetime.now(timezone.utc).isoformat()
@@ -136,13 +135,23 @@ def _store_jobs_filtered(
         url = job.get("url")
         if not url:
             continue
-        if not _location_ok(job.get("location"), accept_locs, reject_locs):
+        triage = workday._triage_location(
+            job.get("location"),
+            accept_locs,
+            reject_locs,
+            policy="recall_first",
+            search_cfg=search_cfg,
+        )
+        if triage.decision == "reject":
             filtered += 1
             continue
+        review_status = "manual_review" if triage.decision == "manual_review" else None
+        review_reason = f"smart_extract_location:{triage.reason}" if review_status else None
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
+                "review_status, review_reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     url,
                     job.get("title"),
@@ -152,6 +161,8 @@ def _store_jobs_filtered(
                     site,
                     strategy,
                     now,
+                    review_status,
+                    review_reason,
                 ),
             )
             new += 1
@@ -1115,6 +1126,7 @@ def _run_all(
     targets: list[dict],
     accept_locs: list[str],
     reject_locs: list[str],
+    search_cfg: dict | None = None,
     workers: int = 1,
 ) -> dict:
     """Run smart extract on all targets.
@@ -1137,7 +1149,13 @@ def _run_all(
         jobs = r.get("jobs", [])
         if jobs:
             new, existing = _store_jobs_filtered(
-                conn, jobs, target["name"], r.get("strategy", "?"), accept_locs, reject_locs
+                conn,
+                jobs,
+                target["name"],
+                r.get("strategy", "?"),
+                accept_locs,
+                reject_locs,
+                search_cfg,
             )
             total_new += new
             total_existing += existing
@@ -1220,4 +1238,4 @@ def run_smart_extract(
         workers,
     )
 
-    return _run_all(targets, accept_locs, reject_locs, workers=workers)
+    return _run_all(targets, accept_locs, reject_locs, search_cfg=search_cfg, workers=workers)
