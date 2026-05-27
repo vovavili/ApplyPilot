@@ -300,6 +300,22 @@ def test_acquire_job_refuses_target_that_fails_readiness(monkeypatch, tmp_path):
     conn.close()
 
 
+@pytest.mark.parametrize("application_url", ["", "None", " none ", "NULL", "nan", "N/A", "ftp://example.com/apply"])
+def test_readiness_blocks_placeholder_application_urls(monkeypatch, tmp_path, application_url):
+    conn = init_db(tmp_path / "applypilot.db")
+    job = _job(application_url=application_url)
+    _insert_prepped_job(conn, job, *_write_artifacts(tmp_path, job))
+    _patch_environment(monkeypatch, conn)
+
+    row = conn.execute("SELECT * FROM jobs WHERE url = ?", (job["url"],)).fetchone()
+    readiness = check_job_ready(row, conn, profile=_profile())
+
+    assert not readiness.ready
+    assert "missing_application_url" in readiness.reasons
+    assert launcher.acquire_job(target_url=job["url"], min_score=7, worker_id=1) is None
+    conn.close()
+
+
 _TEXT = st.text(
     alphabet=st.characters(blacklist_categories=("Cs",), blacklist_characters="\x00"),
     min_size=1,

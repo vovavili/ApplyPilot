@@ -92,6 +92,67 @@ def test_build_prompt_keeps_private_salary_out_of_applicant_profile(monkeypatch,
     assert "HUMANIZER:screening" in built
 
 
+def test_build_prompt_ignores_placeholder_application_url(monkeypatch, tmp_path):
+    resume_txt = tmp_path / "tailored_resume.txt"
+    resume_pdf = tmp_path / "tailored_resume.pdf"
+    resume_txt.write_text("resume text", encoding="utf-8")
+    resume_pdf.write_bytes(b"%PDF-1.4\n")
+
+    monkeypatch.setattr(prompt.config, "load_profile", _profile)
+    monkeypatch.setattr(prompt.config, "load_search_config", lambda: {"location": {"accept_patterns": ["The Hague"]}})
+    monkeypatch.setattr(prompt.config, "APPLY_WORKER_DIR", tmp_path / "workers")
+    monkeypatch.setattr(prompt, "_build_captcha_section", lambda: "CAPTCHA TEST SECTION")
+    monkeypatch.setattr(prompt, "get_humanizer_prompt", lambda target: f"HUMANIZER:{target}")
+    monkeypatch.setattr(app_config, "load_blocked_sso", lambda: [])
+
+    built = prompt.build_prompt(
+        job={
+            "url": "https://example.com/job",
+            "application_url": "None",
+            "title": "Data Engineer",
+            "site": "ExampleCo",
+            "salary": "€130,000 - €150,000",
+            "fit_score": 9,
+            "tailored_resume_path": str(resume_txt),
+        },
+        tailored_resume="TAILORED RESUME TEXT",
+    )
+
+    assert "URL: https://example.com/job" in built
+    assert "URL: None" not in built
+
+
+def test_build_prompt_dry_run_uses_non_mutating_result_code(monkeypatch, tmp_path):
+    resume_txt = tmp_path / "tailored_resume.txt"
+    resume_pdf = tmp_path / "tailored_resume.pdf"
+    resume_txt.write_text("resume text", encoding="utf-8")
+    resume_pdf.write_bytes(b"%PDF-1.4\n")
+
+    monkeypatch.setattr(prompt.config, "load_profile", _profile)
+    monkeypatch.setattr(prompt.config, "load_search_config", lambda: {"location": {"accept_patterns": ["The Hague"]}})
+    monkeypatch.setattr(prompt.config, "APPLY_WORKER_DIR", tmp_path / "workers")
+    monkeypatch.setattr(prompt, "_build_captcha_section", lambda: "CAPTCHA TEST SECTION")
+    monkeypatch.setattr(prompt, "get_humanizer_prompt", lambda target: f"HUMANIZER:{target}")
+    monkeypatch.setattr(app_config, "load_blocked_sso", lambda: [])
+
+    built = prompt.build_prompt(
+        job={
+            "url": "https://example.com/job",
+            "application_url": "https://example.com/apply",
+            "title": "Data Engineer",
+            "site": "ExampleCo",
+            "salary": "€130,000 - €150,000",
+            "fit_score": 9,
+            "tailored_resume_path": str(resume_txt),
+        },
+        tailored_resume="TAILORED RESUME TEXT",
+        dry_run=True,
+    )
+
+    assert "RESULT:DRY_RUN" in built
+    assert "Do NOT click the final Submit/Apply button" in built
+
+
 def test_humanizer_is_opt_in_and_uses_configured_prompt(monkeypatch, tmp_path):
     prompt_path = tmp_path / "humanizer.md"
     prompt_path.write_text("Custom humanizer rules.", encoding="utf-8")

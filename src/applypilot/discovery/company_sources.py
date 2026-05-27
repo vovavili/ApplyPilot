@@ -43,6 +43,7 @@ DEFAULT_HEADERS = {
 NETFLIX_AMSTERDAM_URL = "https://explore.jobs.netflix.net/careers/%2A/amsterdam_netherlands?domain=netflix.com"
 UBER_SEARCH_URL = "https://www.uber.com/us/en/careers/list/?query={query_encoded}&location={location_encoded}"
 UBER_SEARCH_API_URL = "https://www.uber.com/api/loadSearchJobsResults?localeCode=en"
+MISSING_TEXT_VALUES = {"", "none", "null", "nan", "n/a", "na"}
 
 
 @dataclass(frozen=True)
@@ -733,16 +734,25 @@ def _make_job(
     application_url: object | None = None,
     salary: object | None = None,
 ) -> dict:
+    url_text = _optional_text(url)
+    application_url_text = _optional_text(application_url) or url_text or ""
     return {
         "source_key": source_key,
         "company": company.get("name"),
         "title": str(title or "").strip(),
-        "url": str(url or "").strip(),
-        "application_url": str(application_url or url or "").strip(),
+        "url": url_text or "",
+        "application_url": application_url_text,
         "salary": str(salary).strip() if salary else None,
         "location": _clean_location(location),
         "full_description": str(full_description or "").strip(),
     }
+
+
+def _optional_text(value: object) -> str | None:
+    text = str(value or "").strip()
+    if text.casefold() in MISSING_TEXT_VALUES:
+        return None
+    return text
 
 
 def _triaged_job(

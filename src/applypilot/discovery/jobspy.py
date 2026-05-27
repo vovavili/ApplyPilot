@@ -20,6 +20,7 @@ from applypilot.discovery import workday
 from applypilot.events import emit_error, emit_event
 
 log = logging.getLogger(__name__)
+MISSING_TEXT_VALUES = {"", "none", "null", "nan", "n/a", "na"}
 
 
 # -- Proxy parsing -----------------------------------------------------------
@@ -105,6 +106,13 @@ def _location_ok(
     )
 
 
+def _optional_text(value) -> str | None:
+    text = str(value or "").strip()
+    if text.casefold() in MISSING_TEXT_VALUES:
+        return None
+    return text
+
+
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
 
 
@@ -155,7 +163,7 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             detail_scraped_at = now
 
         # Extract apply URL if JobSpy provided it
-        apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
+        apply_url = _optional_text(row.get("job_url_direct"))
         review_status = "manual_review" if row.get("_location_decision") == "manual_review" else None
         review_reason = f"jobspy_location:{row.get('_location_reason')}" if review_status else None
 

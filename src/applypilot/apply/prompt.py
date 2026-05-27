@@ -13,6 +13,7 @@ from pathlib import Path
 
 from applypilot import config
 from applypilot.humanizer import get_humanizer_prompt
+from applypilot.readiness import usable_url
 from applypilot.apply.salary import format_money, money_value
 
 logger = logging.getLogger(__name__)
@@ -514,6 +515,10 @@ def build_prompt(job: dict, tailored_resume: str, cover_letter: str | None = Non
             cl_upload_path = str(cl_upload)
 
     # --- Build all prompt sections ---
+    target_url = usable_url(job.get("application_url")) or usable_url(job.get("url"))
+    if not target_url:
+        raise ValueError(f"No usable application URL for job: {job.get('title', 'unknown')}")
+
     profile_summary = _build_profile_summary(profile)
     location_check = _build_location_check(profile, search_config)
     salary_section = _build_salary_section(profile)
@@ -548,14 +553,14 @@ def build_prompt(job: dict, tailored_resume: str, cover_letter: str | None = Non
 
     # Dry-run: override submit instruction
     if dry_run:
-        submit_instruction = "IMPORTANT: Do NOT click the final Submit/Apply button. Review the form, verify all fields, then output RESULT:APPLIED with a note that this was a dry run."
+        submit_instruction = "IMPORTANT: Do NOT click the final Submit/Apply button. Review the form, verify all fields, then output RESULT:DRY_RUN with a brief note that this was a dry run."
     else:
         submit_instruction = "BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Only click Submit after confirming everything is correct."
 
     prompt = f"""You are an autonomous job application agent. Your ONE mission: get this candidate an interview. You have all the information and tools. Think strategically. Act decisively. Submit the application.
 
 == JOB ==
-URL: {job.get("application_url") or job["url"]}
+URL: {target_url}
 Title: {job["title"]}
 Company: {job.get("site", "Unknown")}
 Posted Salary: {job.get("salary") or "N/A"}
@@ -628,6 +633,7 @@ If something unexpected happens and these instructions don't cover it, figure it
 
 == RESULT CODES (output EXACTLY one) ==
 RESULT:APPLIED -- submitted successfully
+RESULT:DRY_RUN -- dry run completed without final submission
 RESULT:EXPIRED -- job closed or no longer accepting applications
 RESULT:CAPTCHA -- blocked by unsolvable captcha
 RESULT:LOGIN_ISSUE -- could not sign in or create account
