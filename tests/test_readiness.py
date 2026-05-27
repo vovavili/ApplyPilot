@@ -301,7 +301,7 @@ def test_acquire_job_refuses_target_that_fails_readiness(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("application_url", ["", "None", " none ", "NULL", "nan", "N/A", "ftp://example.com/apply"])
-def test_readiness_blocks_placeholder_application_urls(monkeypatch, tmp_path, application_url):
+def test_readiness_allows_placeholder_application_url_when_job_url_is_usable(monkeypatch, tmp_path, application_url):
     conn = init_db(tmp_path / "applypilot.db")
     job = _job(application_url=application_url)
     _insert_prepped_job(conn, job, *_write_artifacts(tmp_path, job))
@@ -310,9 +310,24 @@ def test_readiness_blocks_placeholder_application_urls(monkeypatch, tmp_path, ap
     row = conn.execute("SELECT * FROM jobs WHERE url = ?", (job["url"],)).fetchone()
     readiness = check_job_ready(row, conn, profile=_profile())
 
+    assert readiness.ready
+    assert "missing_application_url" not in readiness.reasons
+    assert launcher.acquire_job(target_url=job["url"], min_score=7, worker_id=1)["url"] == job["url"]
+    conn.close()
+
+
+def test_readiness_blocks_when_both_application_and_job_urls_are_unusable(monkeypatch, tmp_path):
+    conn = init_db(tmp_path / "applypilot.db")
+    job = _job(url="None", application_url="None")
+    _insert_prepped_job(conn, job, *_write_artifacts(tmp_path, {"url": "https://example.com/jobs/1", **job}))
+    _patch_environment(monkeypatch, conn)
+
+    row = conn.execute("SELECT * FROM jobs").fetchone()
+    readiness = check_job_ready(row, conn, profile=_profile())
+
     assert not readiness.ready
     assert "missing_application_url" in readiness.reasons
-    assert launcher.acquire_job(target_url=job["url"], min_score=7, worker_id=1) is None
+    assert launcher.acquire_job(target_url="None", min_score=7, worker_id=1) is None
     conn.close()
 
 

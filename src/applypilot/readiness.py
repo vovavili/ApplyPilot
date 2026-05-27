@@ -191,7 +191,7 @@ def _check_required_fields(job: dict, result: ReadinessResult, min_score: int) -
         result.fail("manual_review")
     if (job.get("fit_score") or 0) < min_score:
         result.fail("score_below_minimum")
-    if not usable_url(job.get("application_url")):
+    if not usable_url(job.get("application_url")) and not usable_url(job.get("url")):
         result.fail("missing_application_url")
     if not job.get("tailored_resume_path"):
         result.fail("missing_tailored_resume_path")
