@@ -46,8 +46,6 @@ EUROPE_TERMS = (
 )
 SHORT_EU_TERMS = ("eu",)
 NL_TERMS = (
-    "netherlands",
-    "nederland",
     "amsterdam",
     "rotterdam",
     "utrecht",
@@ -55,10 +53,7 @@ NL_TERMS = (
     "den haag",
     "delft",
     "leiden",
-    "eindhoven",
-    "north holland",
     "south holland",
-    "noord-holland",
     "zuid-holland",
 )
 VAGUE_LOCATION_TERMS = (

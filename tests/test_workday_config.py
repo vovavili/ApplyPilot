@@ -185,6 +185,19 @@ def test_workday_location_triage_reject_examples(location):
     assert triage.decision == "reject"
 
 
+def test_workday_location_triage_respects_randstad_config_without_broad_nl_accept():
+    accept = ["Remote", "Amsterdam", "Rotterdam", "Utrecht", "The Hague", "Rijswijk", "Breda", "South Holland"]
+    reject = ["Maastricht", "Limburg"]
+
+    assert workday._triage_location("Amsterdam, North Holland, Netherlands", accept, reject).decision == "accept"
+    assert workday._triage_location("Rijswijk, South Holland, Netherlands", accept, reject).decision == "accept"
+    assert workday._triage_location("Breda, North Brabant, Netherlands", accept, reject).decision == "accept"
+    assert workday._triage_location("Remote, Netherlands", accept, reject).decision == "accept"
+    assert workday._triage_location("Maastricht, Limburg, Netherlands", accept, reject).decision == "reject"
+    assert workday._triage_location("North Brabant, Netherlands", accept, reject).decision == "manual_review"
+    assert workday._triage_location("Enkhuizen, North Holland, Netherlands", accept, reject).decision == "manual_review"
+
+
 def test_select_employers_matches_keys_and_display_names():
     employers = {
         "thomson_reuters": {"name": "Thomson Reuters"},
